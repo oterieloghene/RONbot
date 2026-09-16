@@ -17,6 +17,12 @@ async def init_pool() -> None:
     async with _pool.acquire() as conn:
         await conn.execute(schema_sql)
 
+    seed_path = pathlib.Path(__file__).parent / "locations_seed.sql"
+    if seed_path.exists():
+        seed_sql = seed_path.read_text()
+        async with _pool.acquire() as conn:
+            await conn.execute(seed_sql)
+
 
 def pool() -> asyncpg.Pool:
     if _pool is None:

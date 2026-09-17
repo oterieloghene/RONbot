@@ -54,6 +54,23 @@ CREATE TABLE IF NOT EXISTS refinery_stock (
     refining_ready_at TIMESTAMPTZ
 );
 
+-- !buy-trailer/!buy-tanker costs treasury (or the national treasury, for
+-- Nigeria's fleet) and needs that state's Commissioner of Finance --or,
+-- for Nigeria, the Minister of Finance-- to !approve-vehicle it before
+-- the state_vehicles row is actually created. Same pending/approved/
+-- denied shape as drill_requests.
+CREATE TABLE IF NOT EXISTS vehicle_purchase_requests (
+    id           SERIAL PRIMARY KEY,
+    owner_state  TEXT NOT NULL,       -- DELTA / LAGOS / ABUJA / NIGERIA
+    vehicle_type TEXT NOT NULL,       -- trailer / tanker
+    requested_by BIGINT NOT NULL,
+    cost         NUMERIC(14,2) NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / denied
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_by   BIGINT,
+    decided_at   TIMESTAMPTZ
+);
+
 -- A state- or Nigeria-owned trailer/tanker. unit_number is per
 -- (owner_state, vehicle_type), used for its display name (e.g. "Lagos
 -- Trailer 2", "Nigeria Tanker 1" -- see _vehicle_name in

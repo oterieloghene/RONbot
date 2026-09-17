@@ -38,6 +38,33 @@ async def init_pool() -> None:
         async with _pool.acquire() as conn:
             await conn.execute(zones_seed_path.read_text())
 
+    # Banking backend (bank_accounts, players.cash) -- schema_transportation.sql's
+    # state_accounts / credit_ministry_of_commerce() stand-in still handles the
+    # *organization* side (treasury, Ministry of Commerce); this is the real
+    # player-side account backend that banking.py already assumed existed.
+    banking_schema_path = pathlib.Path(__file__).parent / "schema_banking.sql"
+    if banking_schema_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(banking_schema_path.read_text())
+
+    # Private car system: tiers, dealership catalog, ownership, fuel,
+    # distances, interstate routes, trips. See schema_vehicles.sql.
+    vehicles_schema_path = pathlib.Path(__file__).parent / "schema_vehicles.sql"
+    if vehicles_schema_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(vehicles_schema_path.read_text())
+
+    for seed_name in (
+        "vehicle_tiers_seed.sql",
+        "fuel_stations_seed.sql",
+        "interstate_routes_seed.sql",
+        "location_coordinates_seed.sql",
+    ):
+        seed_file = pathlib.Path(__file__).parent / seed_name
+        if seed_file.exists():
+            async with _pool.acquire() as conn:
+                await conn.execute(seed_file.read_text())
+
 
 def pool() -> asyncpg.Pool:
     if _pool is None:
@@ -132,3 +159,191 @@ async def set_player_location(discord_id: int, location_id: int | None) -> None:
         discord_id,
         location_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Banking -- backs cogs/banking.py (deposit/withdraw/transfer/get_personal_account/
+# create_personal_account/get_cash_balance/get_transaction_log_channel_id all
+# already called that cog before any of this existed). Cash (players.cash) and
+# bank balance (bank_accounts.balance) are separate pools; !dep and !with move
+# money between them, !transfer moves bank balance to another account.
+# ---------------------------------------------------------------------------
+
+class InsufficientFunds(Exception):
+    pass
+
+
+class NoBankAccount(ValueError):
+    """Subclasses ValueError so banking.py's existing
+    `except (database.InsufficientFunds, ValueError)` already catches this
+    without banking.py needing to change."""
+    pass
+
+
+def _bank_state_code(state: str) -> str:
+    return "".join(c for c in state.upper() if c.isalpha())[:2]
+
+
+async def get_personal_account(discord_id: int) -> asyncpg.Record | None:
+    return await pool().fetchrow(
+        "SELECT * FROM bank_accounts WHERE discord_id = $1", discord_id
+    )
+
+
+async def create_personal_account(discord_id: int, state: str, created_by: int) -> str:
+    seq_val = await pool().fetchval("SELECT nextval('bank_account_seq')")
+    account_number = f"{_bank_state_code(state)}-BK-{seq_val:06d}"
+    await pool().execute(
+        """
+        INSERT INTO bank_accounts (account_number, discord_id, state, created_by)
+        VALUES ($1, $2, $3, $4)
+        """,
+        account_number,
+        discord_id,
+        state,
+        created_by,
+    )
+    return account_number
+
+
+async def get_cash_balance(discord_id: int) -> float:
+    value = await pool().fetchval(
+        "SELECT cash FROM players WHERE discord_id = $1", discord_id
+    )
+    return float(value or 0)
+
+
+async def get_transaction_log_channel_id(state: str) -> int | None:
+    return await pool().fetchval(
+        """
+        SELECT channel_id FROM locations
+        WHERE state = $1 AND category = 'BANK PLC' AND channel_name = 'transaction-log'
+        """,
+        state.upper(),
+    )
+
+
+async def deposit(discord_id: int, amount: float, performed_by: int, location_state: str) -> dict:
+    """Moves cash -> bank balance (a player handing physical cash to Bank Staff)."""
+    if amount <= 0:
+        raise ValueError("Amount must be positive.")
+
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            account = await conn.fetchrow(
+                "SELECT * FROM bank_accounts WHERE discord_id = $1 FOR UPDATE", discord_id
+            )
+            if account is None:
+                raise NoBankAccount("That player doesn't have a bank account yet.")
+
+            cash = await conn.fetchval(
+                "SELECT cash FROM players WHERE discord_id = $1 FOR UPDATE", discord_id
+            )
+            if float(cash or 0) < amount:
+                raise InsufficientFunds("That player doesn't have that much cash on hand.")
+
+            await conn.execute(
+                "UPDATE players SET cash = cash - $2 WHERE discord_id = $1", discord_id, amount
+            )
+            account = await conn.fetchrow(
+                """
+                UPDATE bank_accounts SET balance = balance + $2
+                WHERE discord_id = $1
+                RETURNING *
+                """,
+                discord_id,
+                amount,
+            )
+    return {"account": account}
+
+
+async def withdraw(discord_id: int, amount: float, location_state: str) -> dict:
+    """Moves bank balance -> cash."""
+    if amount <= 0:
+        raise ValueError("Amount must be positive.")
+
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            account = await conn.fetchrow(
+                "SELECT * FROM bank_accounts WHERE discord_id = $1 FOR UPDATE", discord_id
+            )
+            if account is None:
+                raise NoBankAccount("You don't have a bank account yet.")
+            if float(account["balance"]) < amount:
+                raise InsufficientFunds("Insufficient funds in your bank account.")
+
+            account = await conn.fetchrow(
+                """
+                UPDATE bank_accounts SET balance = balance - $2
+                WHERE discord_id = $1
+                RETURNING *
+                """,
+                discord_id,
+                amount,
+            )
+            await conn.execute(
+                "UPDATE players SET cash = cash + $2 WHERE discord_id = $1", discord_id, amount
+            )
+    return {"account": account}
+
+
+async def transfer(from_discord_id: int, to_account_number: str, amount: float, location_state: str) -> dict:
+    """Moves bank balance -> another account's bank balance."""
+    if amount <= 0:
+        raise ValueError("Amount must be positive.")
+
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            from_account = await conn.fetchrow(
+                "SELECT * FROM bank_accounts WHERE discord_id = $1 FOR UPDATE", from_discord_id
+            )
+            if from_account is None:
+                raise NoBankAccount("You don't have a bank account yet.")
+            if float(from_account["balance"]) < amount:
+                raise InsufficientFunds("Insufficient funds in your bank account.")
+
+            to_account = await conn.fetchrow(
+                "SELECT * FROM bank_accounts WHERE account_number = $1 FOR UPDATE", to_account_number
+            )
+            if to_account is None:
+                raise ValueError(f"No account `{to_account_number}` exists.")
+            if to_account["account_number"] == from_account["account_number"]:
+                raise ValueError("You can't transfer to your own account.")
+
+            from_account = await conn.fetchrow(
+                "UPDATE bank_accounts SET balance = balance - $2 WHERE discord_id = $1 RETURNING *",
+                from_discord_id,
+                amount,
+            )
+            to_account = await conn.fetchrow(
+                "UPDATE bank_accounts SET balance = balance + $2 WHERE account_number = $1 RETURNING *",
+                to_account_number,
+                amount,
+            )
+    return {"from_account": from_account, "to_account": to_account}
+
+
+async def debit_bank_account(discord_id: int, amount: float) -> asyncpg.Record:
+    """Programmatic debit straight from a player's bank balance -- for
+    purchases like !refuel / !buy-car rather than a player-initiated banking
+    command. Raises NoBankAccount / InsufficientFunds; returns the updated
+    account row on success."""
+    if amount <= 0:
+        raise ValueError("Amount must be positive.")
+
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            account = await conn.fetchrow(
+                "SELECT * FROM bank_accounts WHERE discord_id = $1 FOR UPDATE", discord_id
+            )
+            if account is None:
+                raise NoBankAccount("You don't have a bank account yet -- get one opened at a bank first.")
+            if float(account["balance"]) < amount:
+                raise InsufficientFunds("Insufficient funds in your bank account.")
+
+            account = await conn.fetchrow(
+                "UPDATE bank_accounts SET balance = balance - $2 WHERE discord_id = $1 RETURNING *",
+                discord_id,
+                amount,
+            )
+    return account

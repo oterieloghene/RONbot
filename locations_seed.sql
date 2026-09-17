@@ -265,6 +265,7 @@ INSERT INTO locations (state, category, channel_name, is_voice, role_gated) VALU
 ('ABUJA', 'CENTRAL BANK OF NIGERIA', 'cbn-deputy', FALSE, TRUE),
 ('ABUJA', 'CENTRAL BANK OF NIGERIA', 'cbn-governor', FALSE, TRUE),
 ('ABUJA', 'CENTRAL BANK OF NIGERIA', 'cbn-log', FALSE, TRUE),
+('ABUJA', 'CENTRAL BANK OF NIGERIA', 'national-treasury', FALSE, TRUE),
 ('ABUJA', 'POLICE DEPARTMENT', 'police-station', FALSE, FALSE),
 ('ABUJA', 'POLICE DEPARTMENT', 'officers-office', FALSE, TRUE),
 ('ABUJA', 'POLICE DEPARTMENT', 'investigation-room', FALSE, TRUE),

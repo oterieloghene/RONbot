@@ -18,6 +18,7 @@ INSERT INTO roles (name) VALUES
 ('Business Owner'),
 ('Butcher'),
 ('Campus Resident'),
+('CBN Governor'),
 ('Chief Immigration Marshal'),
 ('Chief Medical Director'),
 ('Chief of Staff'),

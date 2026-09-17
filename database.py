@@ -65,6 +65,13 @@ async def init_pool() -> None:
             async with _pool.acquire() as conn:
                 await conn.execute(seed_file.read_text())
 
+    # Oil/fuel economy: drilling, refining, the trailer/tanker fleet, and
+    # the national treasury. See schema_petroleum.sql and cogs/petroleum.py.
+    petroleum_schema_path = pathlib.Path(__file__).parent / "schema_petroleum.sql"
+    if petroleum_schema_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(petroleum_schema_path.read_text())
+
 
 def pool() -> asyncpg.Pool:
     if _pool is None:

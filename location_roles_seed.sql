@@ -398,7 +398,9 @@ FROM (VALUES
   ('ABUJA', 'FARMS', 'farmland', 'FCT Commissioner of Agriculture'),
   ('ABUJA', 'FARMS', 'ranch', 'Rancher'),
   ('ABUJA', 'FARMS', 'ranch', 'Butcher'),
-  ('ABUJA', 'FARMS', 'ranch', 'FCT Commissioner of Agriculture')
+  ('ABUJA', 'FARMS', 'ranch', 'FCT Commissioner of Agriculture'),
+  ('ABUJA', 'CENTRAL BANK OF NIGERIA', 'national-treasury', 'CBN Governor'),
+  ('ABUJA', 'CENTRAL BANK OF NIGERIA', 'national-treasury', 'Minister of Finance')
 ) AS v(state, category, channel_name, role_name)
 JOIN locations l ON l.state = v.state AND l.category = v.category AND l.channel_name = v.channel_name
 JOIN roles r ON r.name = v.role_name

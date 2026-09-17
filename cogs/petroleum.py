@@ -14,14 +14,25 @@ FLOW, END TO END:
 
     A Commissioner of Commerce (or the Minister of Trade and Commerce,
     for Nigeria's fleet) buys a trailer/tanker with !buy-trailer /
-    !buy-tanker, then dispatches it to a pickup location with
-    !order-trailer / !order-tanker (run in the destination channel).
-    Using your own state's vehicle within your own state is free and
-    dispatches immediately; a Nigeria-owned vehicle used within one
-    state is a flat fee, still no approval needed; anything that crosses
-    a state line needs the owning side's sign-off -- posted as an
-    Approve/Decline button card in their Ministry of Commerce channel,
-    never a typed command (see HireDecisionView below).
+    !buy-tanker -- that submits a pending vehicle_purchase_requests row,
+    same shape as !drill: the state's Commissioner of Finance (or, for
+    Nigeria's fleet, the Minister of Finance) has to !approve-vehicle /
+    !decline-vehicle it before the treasury (or national treasury) is
+    actually debited and the vehicle is spawned at its home depot.
+
+    Once owned, it's dispatched to a pickup location with !order-trailer
+    / !order-tanker -- phone-only (Dispatch screen -> Order Trailer/
+    Tanker), never a typed command in a channel: there's no physical
+    channel to infer a destination from, so the Commissioner of Commerce
+    ordering it types the destination directly (state + channel-name,
+    e.g. "lagos refinery") into the modal. Using your own
+    state's vehicle within your own state is free and dispatches
+    immediately -- no approval needed. Every other case needs the
+    owning side's sign-off: a Nigeria-owned vehicle used within a single
+    state is a flat fee + km, and anything that crosses a state line is
+    a (higher) flat fee + km -- both posted as an Approve/Decline button
+    card in the owning side's Ministry of Commerce channel, never a
+    typed command (see HireDecisionView below).
 
     Once a trailer arrives at the oil-well: `!load crude <qty>` pulls
     barrels from the well onto it. At a refinery: `!offload crude <qty>`
@@ -595,6 +606,53 @@ class Petroleum(commands.Cog):
             return
 
         price = VEHICLE_PRICES[vehicle_type]
+        request_id = await database.pool().fetchval(
+            """
+            INSERT INTO vehicle_purchase_requests (owner_state, vehicle_type, requested_by, cost)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+            """,
+            owner_state,
+            vehicle_type,
+            ctx.author.id,
+            price,
+        )
+        approver = (
+            "the Minister of Finance"
+            if owner_state == "NIGERIA"
+            else f"the {owner_state.title()} Commissioner of Finance"
+        )
+        await ctx.send(
+            f"Purchase request #{request_id} submitted for a {vehicle_type} at {price:,.2f} -- "
+            f"awaiting {approver}'s approval."
+        )
+
+    async def _finance_authorized(self, member: discord.Member, owner_state: str) -> bool:
+        if owner_state == "NIGERIA":
+            return await _member_has_role(member, "Minister of Finance")
+        state = await member_commissioner_state(member, "Finance")
+        return state is not None and state.upper() == owner_state
+
+    @commands.command(name="approve-vehicle")
+    async def approve_vehicle(self, ctx: commands.Context, request_id: int):
+        request = await database.pool().fetchrow(
+            "SELECT * FROM vehicle_purchase_requests WHERE id = $1", request_id
+        )
+        if request is None or request["status"] != "pending":
+            await ctx.send("No pending purchase request with that ID.")
+            return
+
+        owner_state = request["owner_state"]
+        if not await self._finance_authorized(ctx.author, owner_state):
+            label = (
+                "Minister of Finance"
+                if owner_state == "NIGERIA"
+                else f"{owner_state.title()} Commissioner of Finance"
+            )
+            await ctx.send(f"Only the {label} can approve this purchase.")
+            return
+
+        price = float(request["cost"])
         try:
             if owner_state == "NIGERIA":
                 await debit_national_treasury(price)
@@ -602,6 +660,12 @@ class Petroleum(commands.Cog):
                 await debit_treasury(owner_state, price)
         except InsufficientTreasuryFunds as e:
             await ctx.send(str(e))
+            return
+
+        vehicle_type = request["vehicle_type"]
+        home = await self._home_location(owner_state)
+        if home is None:
+            await ctx.send("No depot is set up to park it at yet -- funds were not moved.")
             return
 
         unit_number = await database.pool().fetchval(
@@ -619,28 +683,94 @@ class Petroleum(commands.Cog):
             vehicle_type,
             unit_number,
             home["id"],
-            ctx.author.id,
+            request["requested_by"],
             price,
         )
+        await database.pool().execute(
+            "UPDATE vehicle_purchase_requests SET status = 'approved', decided_by = $2, decided_at = now() WHERE id = $1",
+            request_id,
+            ctx.author.id,
+        )
         name = _vehicle_name(owner_state, vehicle_type, unit_number)
-        await ctx.send(f"Purchased {name} for {price:,.2f} -- parked at {home['state'].title()} {home['channel_name']}.")
+        await ctx.send(
+            f"Approved. Purchased {name} for {price:,.2f} -- parked at {home['state'].title()} {home['channel_name']}."
+        )
+
+    @commands.command(name="decline-vehicle")
+    async def decline_vehicle(self, ctx: commands.Context, request_id: int):
+        request = await database.pool().fetchrow(
+            "SELECT * FROM vehicle_purchase_requests WHERE id = $1", request_id
+        )
+        if request is None or request["status"] != "pending":
+            await ctx.send("No pending purchase request with that ID.")
+            return
+
+        owner_state = request["owner_state"]
+        if not await self._finance_authorized(ctx.author, owner_state):
+            label = (
+                "Minister of Finance"
+                if owner_state == "NIGERIA"
+                else f"{owner_state.title()} Commissioner of Finance"
+            )
+            await ctx.send(f"Only the {label} can decline this purchase.")
+            return
+
+        await database.pool().execute(
+            "UPDATE vehicle_purchase_requests SET status = 'denied', decided_by = $2, decided_at = now() WHERE id = $1",
+            request_id,
+            ctx.author.id,
+        )
+        await ctx.send(f"Declined purchase request #{request_id}. No funds were moved.")
 
     # =====================================================================
     # ORDER / HIRE
     # =====================================================================
 
     @commands.command(name="order-trailer")
-    async def order_trailer(self, ctx: commands.Context, fleet: str = "own"):
-        await self._order_vehicle(ctx, "trailer", fleet)
+    async def order_trailer(self, ctx: commands.Context, fleet: str = "own", *, destination: str = None):
+        await self._order_vehicle(ctx, "trailer", fleet, destination)
 
     @commands.command(name="order-tanker")
-    async def order_tanker(self, ctx: commands.Context, fleet: str = "own"):
-        await self._order_vehicle(ctx, "tanker", fleet)
+    async def order_tanker(self, ctx: commands.Context, fleet: str = "own", *, destination: str = None):
+        await self._order_vehicle(ctx, "tanker", fleet, destination)
 
-    async def _order_vehicle(self, ctx: commands.Context, vehicle_type: str, fleet: str):
-        destination = await database.get_location_by_channel(ctx.channel.id)
+    async def _resolve_destination(self, text: str):
+        """Parses a typed '<state> <channel-name>' destination from the
+        phone's Order Trailer/Tanker modal -- 'Lagos refinery' or 'lagos
+        nnpc fuel station' both work; spaces in the channel part are
+        tried both as-is and hyphenated."""
+        parts = text.strip().split(None, 1)
+        if len(parts) < 2:
+            return None
+        state = parts[0].upper()
+        channel_raw = parts[1].strip().lower()
+        for channel_name in {channel_raw, channel_raw.replace(" ", "-")}:
+            location = await database.pool().fetchrow(
+                "SELECT * FROM locations WHERE state = $1 AND channel_name = $2",
+                state,
+                channel_name,
+            )
+            if location is not None:
+                return location
+        return None
+
+    async def _order_vehicle(self, ctx: commands.Context, vehicle_type: str, fleet: str, destination_text: str = None):
+        if not getattr(ctx, "from_phone", False):
+            await ctx.send(
+                "Order a trailer/tanker from your phone -- `!phone` -> Dispatch -> "
+                "Order Trailer/Tanker -- not as a typed command."
+            )
+            return
+
+        if not destination_text:
+            await ctx.send("You need to enter a destination -- `<state> <channel-name>`, e.g. `lagos refinery`.")
+            return
+
+        destination = await self._resolve_destination(destination_text)
         if destination is None:
-            await ctx.send("You can't order a pickup to this channel.")
+            await ctx.send(
+                "Couldn't find that destination -- try `<state> <channel-name>`, e.g. `lagos refinery`."
+            )
             return
 
         authority_state = await _ordering_authority(ctx.author)
@@ -692,7 +822,7 @@ class Petroleum(commands.Cog):
             requires_approval = False
         elif owner_state == "NIGERIA" and not is_interstate:
             fare = HIRE_FLAT_NIGERIA_INTRASTATE[vehicle_type] + distance_km * HIRE_PER_KM[vehicle_type]
-            requires_approval = False
+            requires_approval = True
         else:
             fare = HIRE_FLAT_INTERSTATE[vehicle_type] + distance_km * HIRE_PER_KM[vehicle_type]
             requires_approval = True

@@ -5,17 +5,28 @@ App, and the Bank App.
 
 SCOPE, AS OF THIS FILE:
 
-    RONbot currently only has real commands for two of those twelve
-    screens -- transportation.py (book-bus / buy-brt / approve-brt)
-    and banking.py (cash-bal / with / transfer / create-account / dep).
-    So only "Bus" and "Bank App" actually do anything below; the other
-    ten (BRT Card, Taxi, Flights, Hotel, Contacts, Mechanic, Dispatch,
-    Map, Emergency, My Job App) render a "Coming Soon" screen with a
-    Back button and nothing else, since there's no backend command yet
-    for the phone to call into. Wiring each of those up later is just
-    a matter of adding a new View + modal (if it needs typed input)
-    following the same pattern as BusView / BankAppView below, and
-    swapping its MainMenuView button over from open_coming_soon to it.
+    RONbot currently only has real commands for three of those twelve
+    screens -- transportation.py (book-bus / buy-brt / approve-brt),
+    banking.py (cash-bal / with / transfer / create-account / dep), and
+    petroleum.py's trailer/tanker fleet (buy-trailer / buy-tanker /
+    approve-vehicle / decline-vehicle / order-trailer / order-tanker,
+    wired in below as DispatchView -- see cogs/petroleum.py's module
+    docstring for the full buy -> approve -> order flow). So "Bus",
+    "Bank App", and "Dispatch" actually do something below; the other
+    nine (BRT Card, Taxi, Flights, Hotel, Contacts, Mechanic, Map,
+    Emergency, My Job App) render a "Coming Soon" screen with a Back
+    button and nothing else, since there's no backend command yet for
+    the phone to call into. Wiring each of those up later is just a
+    matter of adding a new View + modal (if it needs typed input)
+    following the same pattern as BusView / BankAppView / DispatchView
+    below, and swapping its MainMenuView button over from
+    open_coming_soon to it.
+
+    Note: interstate (and Nigeria-owned intrastate) hire approvals stay
+    a button card posted straight to the owning side's Ministry of
+    Commerce channel (HireDecisionView in petroleum.py), same as the
+    design note above about bus approvals -- there's deliberately no
+    "Approve/Decline a Hire Request" button on the phone.
 
 HOW THIS WORKS (same approach as the EkoPhone reference file):
 
@@ -81,7 +92,6 @@ COMING_SOON_SCREENS = (
     "Hotel",
     "Contacts",
     "Mechanic",
-    "Dispatch",
     "Map",
     "Emergency",
     "My Job App",
@@ -262,6 +272,82 @@ class DeclineBusModal(discord.ui.Modal, title="Decline a Bus Request"):
         await _invoke(self.bot, interaction, "decline-brt", int(self.request_id.value.strip()))
 
 
+class OrderTrailerModal(discord.ui.Modal, title="Order a Trailer"):
+    destination = discord.ui.TextInput(
+        label="Destination (state + channel name)",
+        placeholder="lagos refinery",
+        max_length=50,
+    )
+    fleet = discord.ui.TextInput(
+        label="Fleet (own / nigeria / a state name)",
+        placeholder="own",
+        required=False,
+        max_length=20,
+    )
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        fleet = self.fleet.value.strip() or "own"
+        await _invoke(self.bot, interaction, "order-trailer", fleet, destination=self.destination.value.strip())
+
+
+class OrderTankerModal(discord.ui.Modal, title="Order a Tanker"):
+    destination = discord.ui.TextInput(
+        label="Destination (state + channel name)",
+        placeholder="lagos nnpc-fuel-station",
+        max_length=50,
+    )
+    fleet = discord.ui.TextInput(
+        label="Fleet (own / nigeria / a state name)",
+        placeholder="own",
+        required=False,
+        max_length=20,
+    )
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        fleet = self.fleet.value.strip() or "own"
+        await _invoke(self.bot, interaction, "order-tanker", fleet, destination=self.destination.value.strip())
+
+
+class ApproveVehicleModal(discord.ui.Modal, title="Approve a Vehicle Purchase"):
+    request_id = discord.ui.TextInput(label="Request ID", placeholder="12", max_length=10)
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        if not self.request_id.value.strip().isdigit():
+            await interaction.followup.send("Request ID has to be a number.", ephemeral=True)
+            return
+        await _invoke(self.bot, interaction, "approve-vehicle", int(self.request_id.value.strip()))
+
+
+class DeclineVehicleModal(discord.ui.Modal, title="Decline a Vehicle Purchase"):
+    request_id = discord.ui.TextInput(label="Request ID", placeholder="12", max_length=10)
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        if not self.request_id.value.strip().isdigit():
+            await interaction.followup.send("Request ID has to be a number.", ephemeral=True)
+            return
+        await _invoke(self.bot, interaction, "decline-vehicle", int(self.request_id.value.strip()))
+
+
 class WithdrawModal(discord.ui.Modal, title="Withdraw"):
     amount = discord.ui.TextInput(label="Amount", placeholder="5000", max_length=15)
 
@@ -390,6 +476,44 @@ class BusView(_OwnedView):
         await interaction.response.edit_message(embed=_phone_embed(), view=MainMenuView(self.bot, self.owner_id))
 
 
+class DispatchView(_OwnedView):
+    """The trailer/tanker fleet -- buy, get a purchase approved/declined
+    by Finance, and order a pickup. Interstate (and Nigeria-owned
+    intrastate) hire approvals are deliberately NOT here -- those are
+    the HireDecisionView button card posted to a Ministry of Commerce
+    channel, same "never a typed command" rule as bus approvals."""
+
+    @discord.ui.button(label="Buy Trailer", style=discord.ButtonStyle.primary, emoji="\U0001f69a")
+    async def buy_trailer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        await _invoke(self.bot, interaction, "buy-trailer")
+
+    @discord.ui.button(label="Buy Tanker", style=discord.ButtonStyle.primary, emoji="\u26fd")
+    async def buy_tanker(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=False)
+        await _invoke(self.bot, interaction, "buy-tanker")
+
+    @discord.ui.button(label="Order Trailer", style=discord.ButtonStyle.secondary, emoji="\U0001f4dd", row=1)
+    async def order_trailer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(OrderTrailerModal(self.bot))
+
+    @discord.ui.button(label="Order Tanker", style=discord.ButtonStyle.secondary, emoji="\U0001f4dd", row=1)
+    async def order_tanker(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(OrderTankerModal(self.bot))
+
+    @discord.ui.button(label="Approve a Purchase", style=discord.ButtonStyle.success, emoji="\u2705", row=2)
+    async def approve_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ApproveVehicleModal(self.bot))
+
+    @discord.ui.button(label="Decline a Purchase", style=discord.ButtonStyle.danger, emoji="\u274c", row=2)
+    async def decline_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(DeclineVehicleModal(self.bot))
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, emoji="\u2b05\ufe0f", row=3)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=_phone_embed(), view=MainMenuView(self.bot, self.owner_id))
+
+
 class BankAppView(_OwnedView):
     @discord.ui.button(label="Cash Balance", style=discord.ButtonStyle.primary, emoji="\U0001f4b5")
     async def cash_balance(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -462,7 +586,9 @@ class MainMenuView(_OwnedView):
 
     @discord.ui.button(label="Dispatch", style=discord.ButtonStyle.primary, emoji="\U0001f4e1", row=1)
     async def dispatch(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._open_coming_soon(interaction, "Dispatch")
+        await interaction.response.edit_message(
+            embed=_phone_embed("Dispatch"), view=DispatchView(self.bot, self.owner_id)
+        )
 
     @discord.ui.button(label="Map", style=discord.ButtonStyle.primary, emoji="\U0001f5fa\ufe0f", row=2)
     async def map_(self, interaction: discord.Interaction, button: discord.ui.Button):

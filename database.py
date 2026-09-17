@@ -17,11 +17,26 @@ async def init_pool() -> None:
     async with _pool.acquire() as conn:
         await conn.execute(schema_sql)
 
+    transport_schema_path = pathlib.Path(__file__).parent / "schema_transportation.sql"
+    if transport_schema_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(transport_schema_path.read_text())
+
     seed_path = pathlib.Path(__file__).parent / "locations_seed.sql"
     if seed_path.exists():
         seed_sql = seed_path.read_text()
         async with _pool.acquire() as conn:
             await conn.execute(seed_sql)
+
+    # roles_seed.sql / location_roles_seed.sql are still run by hand (same as
+    # today) -- they depend on locations_seed.sql already having run.
+    # zones_routes_seed.sql depends on locations_seed.sql too (zone_categories
+    # don't reference locations directly, but keeping the order consistent
+    # avoids surprises), so it's loaded last, automatically.
+    zones_seed_path = pathlib.Path(__file__).parent / "zones_routes_seed.sql"
+    if zones_seed_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(zones_seed_path.read_text())
 
 
 def pool() -> asyncpg.Pool:
@@ -93,3 +108,27 @@ async def complete_immigration(discord_id: int, player_name: str) -> str:
         player_id,
     )
     return player_id
+
+
+# ---------------------------------------------------------------------------
+# Shared location / role lookups (used by banking.py and cogs/transportation.py)
+# ---------------------------------------------------------------------------
+
+async def get_location_by_channel(channel_id: int) -> asyncpg.Record | None:
+    return await pool().fetchrow(
+        "SELECT * FROM locations WHERE channel_id = $1", channel_id
+    )
+
+
+async def get_role_id(name: str) -> int | None:
+    return await pool().fetchval(
+        "SELECT role_id FROM roles WHERE name = $1", name
+    )
+
+
+async def set_player_location(discord_id: int, location_id: int | None) -> None:
+    await pool().execute(
+        "UPDATE players SET current_location_id = $2 WHERE discord_id = $1",
+        discord_id,
+        location_id,
+    )

@@ -22,6 +22,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 INITIAL_COGS = [
     "cogs.onboarding",
     "cogs.immigration",
+    "cogs.banking",
+    "cogs.transportation",
 ]
 
 

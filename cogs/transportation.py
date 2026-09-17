@@ -1,3 +1,5 @@
+import datetime
+
 import discord
 from discord.ext import commands, tasks
 
@@ -14,7 +16,8 @@ STATE_ROLE_LABEL = {
 }
 
 SEAT_CAP = 10
-DWELL_SECONDS = 10          # how long a bus sits at each channel before moving on
+DWELL_SECONDS_EMPTY = 3     # dwell time when nobody boarded/is boarding at this stop
+DWELL_SECONDS_PASSENGER = 5  # dwell time when at least one passenger boarded/is aboard
 TICK_SECONDS = 5            # how often the background loop checks for buses due to move
 DEFAULT_BUS_PRICE = 5_000_000  # placeholder purchase price -- adjust freely
 
@@ -253,6 +256,44 @@ class Transportation(commands.Cog):
         )
         await ctx.send(f"Approved. Bus #{bus_id} purchased and now running, debited from {state} treasury.")
 
+    # -- !decline-brt -----------------------------------------------------------
+
+    @commands.command(name="decline-brt")
+    async def decline_brt(self, ctx: commands.Context, request_id: int):
+        """Requested by a Commissioner of Finance -- rejects a pending bus
+        purchase request. No treasury debit, no bus spawned."""
+        state = await member_commissioner_state(ctx.author, "Finance")
+        if state is None:
+            await ctx.send("Only a Commissioner of Finance can decline a bus purchase.")
+            return
+
+        request = await database.pool().fetchrow(
+            """
+            SELECT bpr.*, r.state AS route_state
+            FROM bus_purchase_requests bpr
+            JOIN routes r ON r.id = bpr.route_id
+            WHERE bpr.id = $1
+            """,
+            request_id,
+        )
+        if request is None or request["status"] != "pending":
+            await ctx.send("No pending request with that ID.")
+            return
+        if request["route_state"] != state.upper():
+            await ctx.send(f"That request is for {request['route_state'].title()}, not {state}.")
+            return
+
+        await database.pool().execute(
+            """
+            UPDATE bus_purchase_requests
+            SET status = 'denied', decided_by = $2, decided_at = now()
+            WHERE id = $1
+            """,
+            request_id,
+            ctx.author.id,
+        )
+        await ctx.send(f"Declined bus request #{request_id}. No funds were moved.")
+
     # -- !book-bus ------------------------------------------------------------
 
     @commands.command(name="book-bus")
@@ -308,6 +349,111 @@ class Transportation(commands.Cog):
             f"Booked. You'll auto-board the next {route['state'].title()} bus for "
             f"{origin_zone['code']}\u2192{dest_zone['code']} that reaches {location['channel_name']}."
         )
+
+    # -- !queue -----------------------------------------------------------------
+
+    @commands.command(name="queue")
+    async def queue(self, ctx: commands.Context):
+        """Shows the player's position in line for a pickup they've already
+        booked at this channel, plus an estimate of how long the bus will
+        take to reach here."""
+        location = await database.get_location_by_channel(ctx.channel.id)
+        if location is None:
+            await ctx.send("There's no bus queue in this channel.")
+            return
+
+        booking = await database.pool().fetchrow(
+            """
+            SELECT * FROM bus_bookings
+            WHERE player_discord_id = $1 AND origin_location_id = $2 AND status = 'waiting'
+            """,
+            ctx.author.id,
+            location["id"],
+        )
+        if booking is None:
+            await ctx.send("You don't have a pending booking here -- book one with `!book-bus` first.")
+            return
+
+        ahead = await database.pool().fetchval(
+            """
+            SELECT count(*) FROM bus_bookings
+            WHERE origin_location_id = $1 AND status = 'waiting' AND booked_at < $2
+            """,
+            location["id"],
+            booking["booked_at"],
+        )
+        queue_number = ahead + 1
+
+        route = await database.pool().fetchrow("SELECT * FROM routes WHERE id = $1", booking["route_id"])
+        # NOTE: assumes one bus per route. If a route ever gets a second
+        # bus, this picks whichever one the query happens to return first.
+        bus = await database.pool().fetchrow(
+            "SELECT * FROM buses WHERE route_id = $1", booking["route_id"]
+        )
+        if bus is None:
+            await ctx.send(
+                f"You're #{queue_number} in line at this stop, but no bus is currently "
+                f"running this route \u2014 ask a Commissioner of Commerce to request one."
+            )
+            return
+
+        stops = await list_route_stops(route)
+        eta_seconds = self._estimate_eta_seconds(bus, stops, location["id"])
+        if eta_seconds is None:
+            await ctx.send(f"You're #{queue_number} in line at this stop. Couldn't compute an ETA for the bus.")
+            return
+
+        minutes, seconds = divmod(int(round(eta_seconds)), 60)
+        eta_text = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        note = ""
+        if queue_number > SEAT_CAP:
+            note = " (you're past this bus's seat cap, so you may end up waiting for the one after)"
+        await ctx.send(
+            f"You're #{queue_number} in line at this stop. The bus is roughly {eta_text} away.{note} "
+            f"(ETA is an estimate -- exact time depends on whether it picks up passengers along the way.)"
+        )
+
+    def _estimate_eta_seconds(self, bus, stops: list, target_location_id: int) -> float | None:
+        """Walks the same ping-pong path _advance_bus follows, from the
+        bus's current stop, counting stops (and dwell time) until it
+        reaches target_location_id. Per-stop dwell time is unknown this
+        far ahead (it depends on whether someone boards/alights there),
+        so the average of the two dwell constants is used as an estimate
+        for every stop after the current leg."""
+        if not stops:
+            return None
+
+        target_index = next((i for i, s in enumerate(stops) if s["id"] == target_location_id), None)
+        if target_index is None:
+            return None
+
+        idx = bus["stop_index"]
+        forward = bus["forward"]
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        remaining_on_current_leg = max((bus["next_move_at"] - now).total_seconds(), 0)
+
+        if idx == target_index:
+            return remaining_on_current_leg
+
+        avg_dwell = (DWELL_SECONDS_EMPTY + DWELL_SECONDS_PASSENGER) / 2
+        total = remaining_on_current_leg
+
+        # Safety cap so a malformed route can't loop forever.
+        for _ in range(len(stops) * 4):
+            next_index = idx + (1 if forward else -1)
+            if next_index >= len(stops):
+                next_index = len(stops) - 2 if len(stops) > 1 else 0
+                forward = False
+            elif next_index < 0:
+                next_index = 1 if len(stops) > 1 else 0
+                forward = True
+            idx = next_index
+            if idx == target_index:
+                return total
+            total += avg_dwell
+
+        return None
 
     # -- background movement / boarding / alighting tick -----------------------
 
@@ -378,6 +524,14 @@ class Transportation(commands.Cog):
         for booking in still_boarded:
             await self._move_transit_view(booking["player_discord_id"], current, next_stop)
 
+        # Dwell longer at a stop where someone actually got on or off, since
+        # that's the case boarding/alighting messages need time to be read.
+        # still_boarded (post-boarding) covers "someone's aboard"; `boarded`
+        # (pre-boarding, from step 1) covers "someone just got off here" even
+        # if the bus is now empty.
+        had_passenger = len(still_boarded) > 0 or len(boarded) > 0
+        dwell_seconds = DWELL_SECONDS_PASSENGER if had_passenger else DWELL_SECONDS_EMPTY
+
         await database.pool().execute(
             """
             UPDATE buses
@@ -389,7 +543,7 @@ class Transportation(commands.Cog):
             next_index,
             forward,
             next_stop["id"],
-            DWELL_SECONDS,
+            dwell_seconds,
         )
 
     async def _try_board(self, booking, bus, location, fare: float, state: str) -> bool:

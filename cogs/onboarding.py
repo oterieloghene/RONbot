@@ -21,6 +21,27 @@ class Onboarding(commands.Cog):
         self.bot = bot
 
     @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """Discord already strips a departed member's roles for us -- this
+        is the DB-side equivalent. Without it, their old players row stays
+        e.g. 'immigrated', so on rejoin _handle_arrival below sees
+        immigration_status != 'unarrived' and silently skips, and they
+        never get a welcome message or get to go through arrival/!name
+        again. Resetting here makes a rejoin behave like a new player, and
+        frees their NIN number back to the pool immediately (not deferred
+        until someone else needs it) along with deleting the now-orphaned
+        NIN role itself.
+        """
+        old_role_id = await database.reset_player_on_leave(member.id)
+        if old_role_id:
+            role = member.guild.get_role(old_role_id)
+            if role:
+                try:
+                    await role.delete(reason="Player left the server -- NIN freed for reuse")
+                except discord.Forbidden:
+                    pass
+
+    @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         before_role_names = {r.name for r in before.roles}
         after_role_names = {r.name for r in after.roles}

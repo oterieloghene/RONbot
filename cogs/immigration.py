@@ -19,9 +19,10 @@ class Immigration(commands.Cog):
     Immigration Office channel:
 
       !name @player Full Name
-          Names the player and grants "{State} Indigine". The arrival role
-          is left alone -- they can still only see the arrival-flow
-          channels at this point.
+          Names the player, manufactures and grants their "NIN-0001-{code}"
+          role, and grants "{State} Indigene". The arrival role is left
+          alone -- they can still only see the arrival-flow channels at
+          this point.
 
       !immigrate @player
           Grants the general "{State}" location role (this is what unlocks
@@ -67,11 +68,31 @@ class Immigration(commands.Cog):
             await ctx.send(f"This has to be run in {state}'s Immigration Office channel.")
             return
 
-        player_id = await database.name_player(member.id, player_name)
+        nin_number = await database.allocate_nin_number()
+        player_id = f"NIN-{nin_number:04d}-{state_cfg['state_code']}"
 
-        indigine_role = discord_utils.get_role(ctx.guild, state_cfg["indigine_role_name"])
-        if indigine_role:
-            await member.add_roles(indigine_role, reason="Named by Immigration Officer")
+        # Defensive only: reset_player_on_leave deletes a departed player's
+        # NIN role the instant they leave, so this number's old role
+        # shouldn't still exist. But if it somehow does (permissions
+        # hiccup, manual recreation, etc.), clear it before manufacturing
+        # the fresh one so two roles never end up sharing a NIN name.
+        stale_role = discord_utils.get_role(ctx.guild, player_id)
+        if stale_role:
+            try:
+                await stale_role.delete(reason="Reassigning this NIN -- clearing stale role first")
+            except discord.Forbidden:
+                pass
+
+        nin_role = await ctx.guild.create_role(
+            name=player_id, reason=f"NIN assigned to {member} by Immigration Officer"
+        )
+        await member.add_roles(nin_role, reason="Named by Immigration Officer")
+
+        await database.finalize_naming(member.id, player_name, player_id, nin_number, nin_role.id)
+
+        indigene_role = discord_utils.get_role(ctx.guild, state_cfg["indigene_role_name"])
+        if indigene_role:
+            await member.add_roles(indigene_role, reason="Named by Immigration Officer")
 
         try:
             await member.edit(nick=player_name)
@@ -80,7 +101,7 @@ class Immigration(commands.Cog):
 
         await ctx.send(
             f"{member.mention} named **{player_name}** ({player_id}) -- "
-            f"now a {state} Indigine. Run !immigrate once ready to give full access."
+            f"now a {state} Indigene. Run !immigrate once ready to give full access."
         )
 
     @commands.command(name="immigrate")

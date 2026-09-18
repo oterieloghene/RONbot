@@ -109,6 +109,7 @@ class FakeMe:
     """guild.me -- the bot's own member object."""
 
     def __init__(self, top_role, manage_roles=True):
+        self.id = 9001
         self.name = "RONbot"
         self.guild_permissions = types.SimpleNamespace(manage_roles=manage_roles)
         self.top_role = top_role
@@ -123,6 +124,7 @@ class FakeGuild:
         self._channels = {}
         self.name = f"{STATE} Roleplay"
         self.me = None
+        self.owner_id = None
 
         border = FakeCategory(f"{STATE} Border & Entry")
         self.bank = FakeCategory(f"{STATE} Bank PLC")
@@ -473,3 +475,67 @@ def test_setup_warns_when_staff_role_ranks_above_bot(db_stubs, caplog):
     assert len(records) == 1
     assert config.IMMIGRATION_OFFICER_ROLE_NAME in records[0].message
     assert "Delta" in records[0].message
+
+
+def test_setup_skips_owner_member_overwrites(db_stubs, caplog):
+    """An explicit member overwrite on the server owner always 50013s (the
+    owner's implicit rank sits above every role, and the owner ignores
+    channel denies anyway) -- the sync must skip the owner instead of
+    logging a fake per-channel failure."""
+    guild = FakeGuild()
+    owner = guild.add_member("server-owner")
+    guild.owner_id = owner.id
+    for channel in guild.channels.values():
+        channel.deny_targets.add(owner)  # would 50013 if attempted
+    db_stubs["player_rows"].append({
+        "discord_id": owner.id,
+        "current_state": STATE,
+        "current_location_id": 1,
+    })
+
+    with caplog.at_level(logging.WARNING):
+        summary = asyncio.run(discord_utils.setup_permissions(guild))
+
+    assert summary["denied"] == 0
+    assert summary["resynced"] == 1
+    for channel in guild.channels.values():
+        assert owner not in channel.permission_overwrites
+
+
+def test_log_role_ladder_marks_bot_top_role(db_stubs, caplog):
+    """The ladder log is the startup ground truth: one line per role in rank
+    order with the bot's top role marked, plus the MANAGE_ROLES bit --
+    whatever Discord's API actually sees, vs what the UI claims."""
+    guild = FakeGuild()
+    bot_role = FakeRole("@bot", position=9)
+    guild.me = FakeMe(bot_role, manage_roles=True)
+    guild.roles.append(bot_role)  # real guild.roles includes the bot's own role
+    guild.add_role("Delta", position=3)
+    guild.add_role("@everyone", position=0)
+
+    with caplog.at_level(logging.INFO):
+        discord_utils.log_role_ladder(guild)
+
+    ladder = [r.message for r in caplog.records if "pos=" in r.message]
+    header = [r.message for r in caplog.records if "Role ladder" in r.message]
+    assert len(header) == 1
+    assert "MANAGE_ROLES: ON" in header[0]
+    # Bot's top role (pos 9) first, Delta (pos 3) next, @everyone last.
+    assert ladder[0].startswith("  role pos=9")
+    assert "<== BOT TOP ROLE" in ladder[0]
+    assert ladder[1].startswith("  role pos=3")
+    assert "Delta" in ladder[1]
+    assert ladder[2].startswith("  role pos=0")
+
+
+def test_log_role_ladder_flags_missing_manage_roles(db_stubs, caplog):
+    guild = FakeGuild()
+    guild.me = FakeMe(FakeRole("@bot"), manage_roles=False)
+    guild.add_role("Delta", position=3)
+
+    with caplog.at_level(logging.INFO):
+        discord_utils.log_role_ladder(guild)
+
+    header = [r.message for r in caplog.records if "Role ladder" in r.message]
+    assert len(header) == 1
+    assert "MANAGE_ROLES: OFF" in header[0]

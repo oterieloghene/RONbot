@@ -65,6 +65,7 @@ class FakeGuild:
         self.roles = []
         self.categories = []
         self.created_roles = []
+        self.owner_id = None
 
         border = FakeCategory(f"{state} Border & Entry")
         self.front_desk = border.add_channel("front-desk")

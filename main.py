@@ -25,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # other marker, the running process is executing stale code -- redeploy from
 # the latest main and fully restart the process (kill the old PID, don't
 # just reload). Compare this against the PR that last changed !name/!immigrate.
-BOT_BUILD = "2025-01-16-permission-setup+429-backoff"
+BOT_BUILD = "2025-01-17-raw-50013-log+role-ladder+owner-guard"
 
 INITIAL_COGS = [
     "cogs.onboarding",
@@ -45,6 +45,10 @@ async def on_ready():
     print(f"Synced {len(synced)} slash command(s)")
     for guild in bot.guilds:
         try:
+            # Log the role ladder first: if an overwrite below gets 50013'd,
+            # the ladder lines are the ground truth for what Discord sees
+            # (bot position, MANAGE_ROLES bit) vs what the UI claims.
+            discord_utils.log_role_ladder(guild)
             summary = await discord_utils.setup_permissions(guild)
             print(f"Permission setup for {guild.name} ({guild.id}): {summary}")
         except Exception:

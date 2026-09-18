@@ -17,6 +17,16 @@ async def init_pool() -> None:
     async with _pool.acquire() as conn:
         await conn.execute(schema_sql)
 
+    # One-time (but safe-to-repeat) fixes for schema changes made after this
+    # DB was first created -- see migration_001.sql's own header. Must run
+    # right after schema.sql, before anything below that depends on the
+    # fixed shape (location_roles_seed.sql needs location_roles' group_id
+    # column to exist).
+    migration_path = pathlib.Path(__file__).parent / "migration_001.sql"
+    if migration_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(migration_path.read_text())
+
     transport_schema_path = pathlib.Path(__file__).parent / "schema_transportation.sql"
     if transport_schema_path.exists():
         async with _pool.acquire() as conn:
@@ -28,8 +38,21 @@ async def init_pool() -> None:
         async with _pool.acquire() as conn:
             await conn.execute(seed_sql)
 
-    # roles_seed.sql / location_roles_seed.sql are still run by hand (same as
-    # today) -- they depend on locations_seed.sql already having run.
+    # roles_seed.sql / location_roles_seed.sql -- both auto-run now (used to
+    # require running by hand, which is exactly the kind of step that's easy
+    # to forget after just editing the file and redeploying). Order matters:
+    # both depend on locations_seed.sql above already having run, and
+    # location_roles_seed.sql additionally depends on roles_seed.sql.
+    roles_seed_path = pathlib.Path(__file__).parent / "roles_seed.sql"
+    if roles_seed_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(roles_seed_path.read_text())
+
+    location_roles_seed_path = pathlib.Path(__file__).parent / "location_roles_seed.sql"
+    if location_roles_seed_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(location_roles_seed_path.read_text())
+
     # zones_routes_seed.sql depends on locations_seed.sql too (zone_categories
     # don't reference locations directly, but keeping the order consistent
     # avoids surprises), so it's loaded last, automatically.

@@ -209,6 +209,52 @@ async def get_state_location_channels(state: str) -> list[asyncpg.Record]:
     )
 
 
+async def get_all_locations() -> list[asyncpg.Record]:
+    """Every seeded location row, INCLUDING ones whose channel_id is still
+    NULL. Feeds the startup channel binding in
+    discord_utils.setup_permissions -- that binding is the ONLY thing that
+    fills locations.channel_id, so it must not filter on it (doing so would
+    leave every row unbound forever)."""
+    return await pool().fetch(
+        """
+        SELECT id, state, category, channel_name, is_voice, role_gated,
+               channel_id, parent_location_id
+        FROM locations
+        ORDER BY id
+        """
+    )
+
+
+async def bind_location_channel(location_id: int, channel_id: int) -> None:
+    """Persist the Discord channel ID for a location. Only writes when the
+    value actually differs, so it's safe to call on every bot startup."""
+    await pool().execute(
+        """
+        UPDATE locations
+        SET channel_id = $2
+        WHERE id = $1 AND (channel_id IS NULL OR channel_id <> $2)
+        """,
+        location_id,
+        channel_id,
+    )
+
+
+async def get_players_needing_sync() -> list[asyncpg.Record]:
+    """Every arrived player, for the startup resync:
+    (discord_id, current_state, current_location_id) for all players who
+    have a current state. Unarrived members have no location, so there's
+    nothing to sync for them."""
+    return await pool().fetch(
+        """
+        SELECT discord_id, current_state, current_location_id
+        FROM players
+        WHERE current_state IS NOT NULL
+          AND immigration_status IN ('arrived', 'named', 'immigrated')
+        ORDER BY discord_id
+        """
+    )
+
+
 _NIN_ALLOCATION_LOCK_KEY = 872341  # arbitrary constant, just needs to be stable
 
 

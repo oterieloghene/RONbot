@@ -18,6 +18,7 @@ import re
 
 import discord
 
+import config
 import database
 import permissions
 
@@ -43,6 +44,81 @@ def get_channel(
         if _normalize(category.name) == target:
             return discord.utils.get(category.channels, name=channel_name)
     return None
+
+
+# Staff keep the game running regardless of their own tracked location:
+# officers run !name/!immigrate at the front desk, the marshal oversees the
+# whole bureau. They need Send Messages on every location channel.
+STAFF_ROLE_NAMES = (
+    config.IMMIGRATION_OFFICER_ROLE_NAME,
+    "Chief Immigration Marshal",
+)
+
+
+async def setup_permissions(guild: discord.Guild) -> dict:
+    """Idempotent permission setup, run once per bot startup (on_ready).
+
+    Three jobs, in order:
+
+    1. BIND -- locations.channel_id is the join key between the DB and the
+       live Discord channels, and nothing else writes it. Resolve every
+       seeded location to its real channel via get_channel() and persist
+       the ID. Without this, get_state_location_channels() returns zero
+       rows and sync_location_permissions() silently no-ops -- the whole
+       writability model is dead for exactly that reason.
+    2. LOCKDOWN -- deny @everyone Send Messages on every location channel.
+       The per-member overwrite model (write only at your current location)
+       only works when the base permission is deny; otherwise any member
+       the bot hasn't processed yet can write everywhere.
+    3. REGRANT + RESYNC -- give the staff roles a Send overwrite on every
+       location channel, then re-run sync_location_permissions for every
+       arrived player, repairing stale/missing per-member overwrites (bot
+       was offline during a move, or rows predate the binding fix).
+
+    Every step is idempotent, so re-running on reconnect is safe.
+    Returns a summary dict for logging.
+    """
+    summary = {"bound": 0, "missing": 0, "channels": 0, "resynced": 0, "skipped": 0}
+
+    locations = await database.get_all_locations()
+    location_channels = []
+    for row in locations:
+        channel = get_channel(guild, row["state"], row["category"], row["channel_name"])
+        if channel is None:
+            summary["missing"] += 1
+            continue
+        if row["channel_id"] != channel.id:
+            await database.bind_location_channel(row["id"], channel.id)
+            summary["bound"] += 1
+        location_channels.append(channel)
+
+    for role_name in STAFF_ROLE_NAMES:
+        role = get_role(guild, role_name)
+        if role is None:
+            continue
+        for channel in location_channels:
+            await channel.set_permissions(
+                role, send_messages=True,
+                reason="RONbot startup: staff can run the game everywhere",
+            )
+    for channel in location_channels:
+        await channel.set_permissions(
+            guild.default_role, send_messages=False,
+            reason="RONbot startup: writability follows travel",
+        )
+    summary["channels"] = len(location_channels)
+
+    for player in await database.get_players_needing_sync():
+        member = guild.get_member(player["discord_id"])
+        if member is None:
+            summary["skipped"] += 1
+            continue
+        await sync_location_permissions(
+            guild, member, player["current_state"], player["current_location_id"]
+        )
+        summary["resynced"] += 1
+
+    return summary
 
 
 async def sync_location_permissions(

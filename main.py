@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 import config
 import database
+import discord_utils
 
 load_dotenv()
 
@@ -24,7 +25,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # other marker, the running process is executing stale code -- redeploy from
 # the latest main and fully restart the process (kill the old PID, don't
 # just reload). Compare this against the PR that last changed !name/!immigrate.
-BOT_BUILD = "2025-01-15-command-scope-fix"
+BOT_BUILD = "2025-01-16-permission-setup"
 
 INITIAL_COGS = [
     "cogs.onboarding",
@@ -42,6 +43,16 @@ async def on_ready():
     print(f"RONbot build {BOT_BUILD} | logged in as {bot.user} ({bot.user.id})")
     synced = await bot.tree.sync()
     print(f"Synced {len(synced)} slash command(s)")
+    for guild in bot.guilds:
+        try:
+            summary = await discord_utils.setup_permissions(guild)
+            print(f"Permission setup for {guild.name} ({guild.id}): {summary}")
+        except Exception:
+            # One guild's setup failing must not kill the whole bot -- the
+            # channel bindings/overwrites can be repaired by a restart.
+            logging.exception(
+                f"Permission setup failed for {guild.name} ({guild.id})"
+            )
 
 
 async def handle_ping(request: web.Request) -> web.Response:

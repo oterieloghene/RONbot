@@ -27,6 +27,11 @@ async def init_pool() -> None:
         async with _pool.acquire() as conn:
             await conn.execute(migration_path.read_text())
 
+    migration_002_path = pathlib.Path(__file__).parent / "migration_002.sql"
+    if migration_002_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(migration_002_path.read_text())
+
     transport_schema_path = pathlib.Path(__file__).parent / "schema_transportation.sql"
     if transport_schema_path.exists():
         async with _pool.acquire() as conn:
@@ -139,27 +144,58 @@ async def record_arrival(discord_id: int, state: str) -> None:
     )
 
 
-async def name_player(discord_id: int, player_name: str) -> str:
-    """Called by !name -- the Immigration Officer's first step. Assigns a
-    sequential player_id like 'DL-000123' and the player's RP name.
-    Does NOT touch roles or immigration_status beyond 'named' -- granting
-    the Indigine role is the caller's job (cogs/immigration.py), since that
-    needs a discord.Member, not just a DB connection. The arrival role is
-    left alone here; !immigrate removes it later."""
-    row = await pool().fetchrow(
-        "SELECT current_state FROM players WHERE discord_id = $1", discord_id
-    )
-    state = row["current_state"]
-    state_code = "".join(c for c in state.upper() if c.isalpha())[:2]
+_NIN_ALLOCATION_LOCK_KEY = 872341  # arbitrary constant, just needs to be stable
 
-    seq_val = await pool().fetchval("SELECT nextval('player_id_seq')")
-    player_id = f"{state_code}-{seq_val:06d}"
 
+async def allocate_nin_number() -> int:
+    """Called by !name -- the Immigration Officer's first step. Hands out
+    the lowest currently-unused NIN number: pulls from freed_nin_numbers
+    first (numbers released the instant a previous holder left the server,
+    see reset_player_on_leave), and only mints a new one past the highest
+    number ever assigned if the pool is empty. Locked with a transaction-
+    scoped advisory lock so two !name calls can't race for the same number.
+
+    Does NOT touch the players row -- the caller (cogs/immigration.py) needs
+    this number first to build the NIN string and manufacture the Discord
+    role before persisting anything, so call finalize_naming() afterward.
+    """
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1)", _NIN_ALLOCATION_LOCK_KEY
+            )
+            freed = await conn.fetchval(
+                "SELECT number FROM freed_nin_numbers ORDER BY number ASC LIMIT 1"
+            )
+            if freed is not None:
+                await conn.execute(
+                    "DELETE FROM freed_nin_numbers WHERE number = $1", freed
+                )
+                return freed
+
+            highest = await conn.fetchval("SELECT MAX(nin_number) FROM players")
+            return (highest or 0) + 1
+
+
+async def finalize_naming(
+    discord_id: int, player_name: str, player_id: str, nin_number: int, role_id: int
+) -> None:
+    """Called by !name once the Immigration Officer's manufactured NIN role
+    has actually been created and assigned in Discord. Persists the name,
+    the formatted player_id (e.g. "NIN-0001-LA"), the underlying nin_number,
+    and the new role's Discord ID (kept so reset_player_on_leave can delete
+    it again if this player later leaves). Does NOT touch the Indigene role
+    or immigration_status beyond 'named' -- granting the Indigene role is
+    the caller's job, since that needs a discord.Member, not just a DB
+    connection. The arrival role is left alone here; !immigrate removes it
+    later."""
     await pool().execute(
         """
         UPDATE players
         SET player_name = $2,
             player_id = $3,
+            nin_number = $4,
+            nin_role_id = $5,
             immigration_status = 'named',
             named_at = now()
         WHERE discord_id = $1
@@ -167,8 +203,62 @@ async def name_player(discord_id: int, player_name: str) -> str:
         discord_id,
         player_name,
         player_id,
+        nin_number,
+        role_id,
     )
-    return player_id
+
+
+async def reset_player_on_leave(discord_id: int) -> int | None:
+    """Called from on_member_remove. A member who leaves has every Discord
+    role stripped automatically -- this is the DB-side equivalent: their
+    progress is wiped back to a brand-new player ('unarrived', no name, no
+    state) so a rejoin goes through arrival and !name from scratch instead
+    of being silently skipped as "already arrived". Their NIN number (if
+    any) is freed back to the pool immediately, not deferred until someone
+    else needs it.
+
+    Returns the Discord role ID of their manufactured NIN role, if they had
+    one, so the caller can delete it -- reassigning a freed number always
+    deletes the old role and creates a fresh one rather than reusing the
+    role object, so it can't be left dangling on the server. Returns None
+    if the member had no player row at all (e.g. left before ever arriving).
+    """
+    async with pool().acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT nin_number, nin_role_id FROM players WHERE discord_id = $1",
+                discord_id,
+            )
+            if row is None:
+                return None
+
+            if row["nin_number"] is not None:
+                await conn.execute(
+                    """
+                    INSERT INTO freed_nin_numbers (number) VALUES ($1)
+                    ON CONFLICT (number) DO NOTHING
+                    """,
+                    row["nin_number"],
+                )
+
+            await conn.execute(
+                """
+                UPDATE players
+                SET immigration_status = 'unarrived',
+                    current_state = NULL,
+                    player_name = NULL,
+                    player_id = NULL,
+                    nin_number = NULL,
+                    nin_role_id = NULL,
+                    arrived_at = NULL,
+                    named_at = NULL,
+                    immigrated_at = NULL
+                WHERE discord_id = $1
+                """,
+                discord_id,
+            )
+
+            return row["nin_role_id"]
 
 
 async def complete_immigration(discord_id: int) -> None:

@@ -39,13 +39,18 @@ IMMIGRATION_OFFICER_ROLE_NAME = "Immigration Officer"
 #                         other state-gated channel. Arrival role IS
 #                         removed at this step.
 #
-# "indigine_role_name" -> granted by !name once the Immigration Officer has
+# "indigene_role_name" -> granted by !name once the Immigration Officer has
 #                         named the player. Arrival role is NOT removed at
 #                         this step. Spelled out explicitly here because
-#                         Abuja's doesn't follow the "{State} Indigine"
-#                         pattern -- it's "FCT Indigine", not "Abuja
-#                         Indigine" (same FCT-naming quirk as employee
+#                         Abuja's doesn't follow the "{State} Indigene"
+#                         pattern -- it's "FCT Indigene", not "Abuja
+#                         Indigene" (same FCT-naming quirk as employee
 #                         roles -- see cogs/banking.py's STATE_ROLE_LABEL).
+#
+# "state_code"          -> the suffix used when the bot manufactures a
+#                         player's NIN role at !name time, e.g. "NIN-0001-LA".
+#                         Spelled out explicitly for the same reason as
+#                         above -- Abuja's is "FCT", not "AB".
 #
 # Arrival Terminal and Immigration Office channels are looked up by
 # discord_utils.get_channel(guild, state, "BORDER & ENTRY", channel_name)
@@ -54,13 +59,16 @@ IMMIGRATION_OFFICER_ROLE_NAME = "Immigration Officer"
 
 STATES = {
     "Abuja": {
-        "indigine_role_name": "FCT Indigine",
+        "state_code": "FCT",
+        "indigene_role_name": "FCT Indigene",
     },
     "Lagos": {
-        "indigine_role_name": "Lagos Indigine",
+        "state_code": "LA",
+        "indigene_role_name": "Lagos Indigene",
     },
     "Delta": {
-        "indigine_role_name": "Delta Indigine",
+        "state_code": "DE",
+        "indigene_role_name": "Delta Indigene",
     },
 }
 

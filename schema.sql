@@ -5,19 +5,27 @@
 
 CREATE TABLE IF NOT EXISTS players (
     discord_id          BIGINT PRIMARY KEY,
-    player_id           TEXT UNIQUE,        -- e.g. "DL-000123", assigned at immigration
+    player_id           TEXT UNIQUE,        -- e.g. "NIN-0001-LA", assigned at !name
     player_name         TEXT,               -- given by the immigration officer
     current_state       TEXT,               -- Abuja / Lagos / Delta
     immigration_status  TEXT NOT NULL DEFAULT 'unarrived',
                          -- 'unarrived' -> 'arrived' -> 'named' -> 'immigrated'
+    nin_number           INTEGER UNIQUE,     -- the "0001" in player_id; global, reused lowest-first
+    nin_role_id          BIGINT,             -- Discord ID of the bot-manufactured NIN role currently held
     arrived_at          TIMESTAMPTZ,
     named_at            TIMESTAMPTZ,
     immigrated_at        TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Sequence used to generate sequential player IDs at immigration time.
-CREATE SEQUENCE IF NOT EXISTS player_id_seq START 1;
+-- NIN numbers released back to the pool the instant a player leaves the
+-- server (see database.reset_player_on_leave). database.allocate_nin_number
+-- always hands out the lowest number sitting in here before minting a new
+-- one, so numbers get reused rather than climbing forever.
+CREATE TABLE IF NOT EXISTS freed_nin_numbers (
+    number    INTEGER PRIMARY KEY,
+    freed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- Every RP channel across all three states, one row per channel. This is raw
 -- reference data only -- it does not yet distinguish location "tiers"

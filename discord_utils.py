@@ -65,8 +65,15 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
     """Log an actionable warning if the bot cannot manage channel overwrites.
 
     Discord 403s (code 50013) an overwrite edit when either:
-      * the bot lacks Manage Channels on that channel, or
-      * the target role/member ranks above the bot's highest role.
+      * the bot lacks Manage Roles on that channel -- the permission the
+        API actually checks for editing channel permission overwrites
+        (NOT Manage Channel Permissions, which only governs channel
+        create/rename/delete), or
+      * the target role/member ranks above the bot's highest role in the
+        server's role list -- the usual culprit when every permission bit
+        is already on: overwrites that target a state role (Delta, ...) or
+        a player whose top role sits above the bot are all rejected, on
+        every channel, no matter how the individual channels are gated.
     Neither is fixable from code -- the operator must fix Server Settings ->
     Roles -- so we say exactly what to change before the per-channel skips
     start piling up.
@@ -74,23 +81,62 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
     me = guild.me
     if me is None:
         return
-    if not me.guild_permissions.manage_channels:
+    if not me.guild_permissions.manage_roles:
         logging.warning(
-            "Permission setup for %s: bot has NO Manage Channels permission. "
-            "Grant it to the bot's role in Server Settings -> Roles, otherwise "
-            "every overwrite below will be skipped and channels stay as-is.",
+            "Permission setup for %s: bot has NO Manage Roles permission. "
+            "That is the permission Discord checks when editing channel "
+            "overwrites (NOT Manage Channel Permissions -- the one that "
+            "has been on from the start). Grant 'Manage Roles' to the bot's "
+            "role in Server Settings -> Roles -> [bot role] -> Advanced, "
+            "otherwise every overwrite below will be rejected with 50013 "
+            "and channels stay as-is.",
             guild.name,
         )
     top = me.top_role
-    for role_name in STAFF_ROLE_NAMES:
-        role = get_role(guild, role_name)
-        if role is not None and role > top:
-            logging.warning(
-                "Permission setup for %s: staff role '%s' ranks ABOVE the bot's "
-                "top role '%s' -- Discord will reject every overwrite on that "
-                "role. Drag the bot's role above it in Server Settings -> Roles.",
-                guild.name, role_name, top.name,
-            )
+    higher = [role for role in guild.roles if role > top]
+    if higher:
+        names = ", ".join(f"'{role.name}'" for role in higher)
+        logging.warning(
+            "Permission setup for %s: these roles rank ABOVE the bot's top "
+            "role '%s': %s. Discord rejects with 50013 every overwrite "
+            "that targets a role above the bot's top role -- or a member "
+            "whose top role does -- so the staff re-grant and the "
+            "per-player travel sync both fail on every channel until the "
+            "bot's role sits above them. Drag the bot's role up in Server "
+            "Settings -> Roles (admin/owner roles may stay above it).",
+            guild.name, top.name, names,
+        )
+
+
+def log_role_ladder(guild: discord.Guild) -> None:
+    """Log the full role ladder at startup, marking the bot's position.
+
+    Ground truth for 50013 debugging: one line per role in rank order with
+    the bot's top role marked, plus the MANAGE_ROLES bit -- the permission
+    Discord actually checks when editing channel overwrites. If the log
+    disagrees with what Server Settings -> Roles shows in the UI, trust the
+    log: that is what the API sees.
+    """
+    me = guild.me
+    if me is None:
+        return
+    top = me.top_role
+    mr = "ON" if me.guild_permissions.manage_roles else "OFF"
+    logging.info(
+        "Role ladder for %s: bot id %s, top role '%s' (%s), MANAGE_ROLES: %s",
+        guild.name, me.id, top.name, top.id, mr,
+    )
+    bot_role_ids = {r.id for r in getattr(me, "roles", [])}
+    for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
+        mark = ""
+        if role.id == top.id:
+            mark = " <== BOT TOP ROLE"
+        elif role.id in bot_role_ids:
+            mark = " [bot role]"
+        logging.info(
+            "  role pos=%-4d %-32s (%s)%s",
+            role.position, role.name, role.id, mark,
+        )
 
 
 async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) -> bool:
@@ -103,12 +149,21 @@ async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) 
     try:
         await channel.set_permissions(target, reason=reason, **overwrite_kwargs)
         return True
-    except discord.Forbidden:
+    except discord.Forbidden as exc:
+        # Log the RAW Discord response: this is ground truth. The rank_hint
+        # is only an interpretation -- when the role ladder looks fine in the
+        # UI, the log line tells us exactly what Discord actually rejected.
+        top_role = getattr(getattr(target, "top_role", None), "name", None)
+        rank_hint = (
+            f" -- '{top_role}' ranks above the bot's top role; drag the bot's "
+            f"role above it in Server Settings -> Roles"
+            if top_role
+            else " -- check Manage Roles on this channel/category too"
+        )
         logging.warning(
-            "Overwrite REJECTED on #%s (%s) for %s: bot is missing Manage "
-            "Channels there, or its top role ranks below the target. Fix in "
-            "Server Settings -> Roles.",
+            "Overwrite REJECTED on #%s (%s) for %s: HTTP %s -- Discord: %s.%s",
             channel.name, channel.id, _target_label(target),
+            exc.status, exc.text or "no response body", rank_hint,
         )
         return False
 
@@ -210,6 +265,13 @@ async def sync_location_permissions(
     """
     rows = await database.get_state_location_channels(state)
     if not rows:
+        return
+    if member.id == guild.owner_id:
+        # The server owner is exempt from every overwrite: an explicit
+        # member overwrite on the owner always 50013s (the owner's implicit
+        # rank sits above every role, so the API rejects it), and the owner
+        # ignores channel denies anyway (implicit Administrator) -- the
+        # @everyone send=False lockdown never applies to them.
         return
     parent_map = {row["id"]: row["parent_location_id"] for row in rows}
     writable = permissions.writable_location_ids(

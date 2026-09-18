@@ -58,6 +58,16 @@ class Onboarding(commands.Cog):
                     pass
 
     @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Handle returning members whose Arrival role was auto-assigned at
+        join time by Discord onboarding (the role arrives in the
+        GUILD_MEMBER_ADD payload, so on_member_update never fires)."""
+        for state, state_cfg in config.STATES.items():
+            if discord.utils.get(member.roles, name=f"{state} Arrival"):
+                await self._handle_arrival(member, state, state_cfg)
+                break
+
+    @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         before_role_names = {r.name for r in before.roles}
         after_role_names = {r.name for r in after.roles}

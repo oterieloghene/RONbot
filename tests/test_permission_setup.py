@@ -313,6 +313,33 @@ def test_setup_denies_everyone_send_on_all_location_channels(db_stubs):
         assert "RONbot startup" in overwrite["reason"]
 
 
+def test_setup_denies_everyone_view_on_role_gated_channels_only(db_stubs):
+    """Role-gated channels must get a View Channel deny on @everyone in the
+    SAME PUT as the Send deny: set_permissions is a full-replace, so a
+    lockdown that only sends send_messages=False wipes any existing
+    view_channel deny on every startup (regression: 'all channels still
+    visible after rejoin'). Non-gated channels must not gain a view
+    overwrite -- their visibility is controlled by role membership alone."""
+    guild = FakeGuild()
+    # gate exactly one channel: refugee-camp (index 2 in LOCATION_ROWS)
+    db_stubs["location_rows"][2]["role_gated"] = True
+
+    asyncio.run(discord_utils.setup_permissions(guild))
+
+    gated = guild.channels["refugee-camp"]
+    gated_overwrite = gated.permission_overwrites[guild.default_role]
+    assert gated_overwrite["view_channel"] is False
+    assert gated_overwrite["send_messages"] is False
+
+    for row in LOCATION_ROWS:
+        if row["channel_name"] == "refugee-camp":
+            continue
+        channel = guild.channels[row["channel_name"]]
+        overwrite = channel.permission_overwrites[guild.default_role]
+        assert "view_channel" not in overwrite
+        assert overwrite["send_messages"] is False
+
+
 # ---------------------------------------------------------------------------
 # REGRANT
 # ---------------------------------------------------------------------------

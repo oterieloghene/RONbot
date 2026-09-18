@@ -193,10 +193,14 @@ async def setup_permissions(guild: discord.Guild) -> dict:
        the ID. Without this, get_state_location_channels() returns zero
        rows and sync_location_permissions() silently no-ops -- the whole
        writability model is dead for exactly that reason.
-    2. LOCKDOWN -- deny @everyone Send Messages on every location channel.
-       The per-member overwrite model (write only at your current location)
-       only works when the base permission is deny; otherwise any member
-       the bot hasn't processed yet can write everywhere.
+    2. LOCKDOWN -- deny @everyone View Channel + Send Messages on every
+       role-gated location channel (send on every channel). The per-member
+       overwrite model (write only at your current location) only works
+       when the base permission is deny; otherwise any member the bot
+       hasn't processed yet can write everywhere. View must be denied
+       explicitly here: set_permissions is a full-replace PUT, so without
+       the view bit in the same call, every startup would wipe the
+       @everyone View Channel deny the role-gate depends on.
     3. REGRANT + RESYNC -- give the staff roles a Send overwrite on every
        location channel, then re-run sync_location_permissions for every
        arrived player, repairing stale/missing per-member overwrites (bot
@@ -218,25 +222,38 @@ async def setup_permissions(guild: discord.Guild) -> dict:
         if row["channel_id"] != channel.id:
             await database.bind_location_channel(row["id"], channel.id)
             summary["bound"] += 1
-        location_channels.append(channel)
+        location_channels.append((channel, row["role_gated"]))
+    summary["channels"] = len(location_channels)
 
+    # -- 2. LOCKDOWN -----------------------------------------------------------
+    # For role-gated channels, deny BOTH View Channel and Send Messages so
+    # non-members can neither see nor type.  For non-gated channels, only
+    # deny Send Messages (visibility is controlled elsewhere).
+    # CRITICAL: set_permissions is a full-replace PUT — sending only
+    # send_messages wipes any existing view_channel deny the role-gate
+    # depends on, so we must include both bits in a single call.
+    for channel, role_gated in location_channels:
+        overwrite_kwargs = {"send_messages": False}
+        if role_gated:
+            overwrite_kwargs["view_channel"] = False
+        if not await _apply_overwrite(
+            channel, guild.default_role,
+            reason="RONbot startup: writability follows travel",
+            **overwrite_kwargs,
+        ):
+            summary["denied"] += 1
+
+    # -- 3. REGRANT staff ------------------------------------------------------
     for role_name in STAFF_ROLE_NAMES:
         role = get_role(guild, role_name)
         if role is None:
             continue
-        for channel in location_channels:
+        for channel, _gated in location_channels:
             if not await _apply_overwrite(
                 channel, role, send_messages=True,
                 reason="RONbot startup: staff can run the game everywhere",
             ):
                 summary["denied"] += 1
-    for channel in location_channels:
-        if not await _apply_overwrite(
-            channel, guild.default_role, send_messages=False,
-            reason="RONbot startup: writability follows travel",
-        ):
-            summary["denied"] += 1
-    summary["channels"] = len(location_channels)
 
     for player in await database.get_players_needing_sync():
         member = guild.get_member(player["discord_id"])

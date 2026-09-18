@@ -263,6 +263,40 @@ def test_setup_counts_missing_channels_without_crashing(db_stubs):
     assert all(lid != 99 for lid, _ in db_stubs["calls"]["bind_location_channel"])
 
 
+def test_get_channel_ignores_voice_channels(db_stubs):
+    """get_channel must never bind a location to a voice channel that
+    reuses the same name -- a send_messages overwrite on a voice channel
+    403s, and the join key points at the wrong channel."""
+    guild = FakeGuild()
+    border = guild.categories[0]
+    original = border.channels[0]  # the seeded text "immigration-office"
+
+    # Drop a voice channel with the same name in front of the text one.
+    voice_ch = border.add_channel("immigration-office")
+    voice_ch.type = discord.ChannelType.voice
+    border.channels.remove(voice_ch)
+    border.channels.insert(0, voice_ch)
+
+    result = discord_utils.get_channel(guild, STATE, "BORDER & ENTRY", "immigration-office")
+    assert result is original
+    assert result is not voice_ch
+
+
+def test_get_channel_returns_none_when_only_voice_channel_exists(db_stubs):
+    """A location whose only same-named channel is a voice channel counts
+    as missing -- it must not be silently bound to the voice channel."""
+    guild = FakeGuild()
+    border = guild.categories[0]
+    border.channels.pop(0)  # drop the seeded text "immigration-office"
+
+    voice_ch = border.add_channel("immigration-office")
+    voice_ch.type = discord.ChannelType.voice
+
+    assert discord_utils.get_channel(
+        guild, STATE, "BORDER & ENTRY", "immigration-office"
+    ) is None
+
+
 # ---------------------------------------------------------------------------
 # LOCKDOWN
 # ---------------------------------------------------------------------------
@@ -379,6 +413,29 @@ def test_setup_skips_players_not_in_guild(db_stubs):
 
     assert summary["skipped"] == 1
     assert summary["resynced"] == 0
+
+
+def test_sync_skips_stale_voice_channel_binding(db_stubs):
+    """A location row whose channel_id still points at a voice channel
+    (bound before get_channel learned to skip voice) must not receive
+    per-member overwrites -- they can never succeed on a voice channel."""
+    guild = FakeGuild()
+    border = guild.categories[0]
+    voice_ch = border.add_channel("immigration-office")
+    voice_ch.type = discord.ChannelType.voice
+    guild._channels[voice_ch.id] = voice_ch
+
+    # Point location 1 (immigration-office) at the voice channel.
+    for row in db_stubs["location_rows"]:
+        if row["id"] == 1:
+            row["channel_id"] = voice_ch.id
+
+    at_office = _add_arrived_player(db_stubs, guild, 1)
+
+    asyncio.run(discord_utils.sync_location_permissions(
+        guild, at_office, STATE, 1))
+
+    assert at_office not in voice_ch.permission_overwrites
 
 
 # ---------------------------------------------------------------------------
@@ -503,9 +560,10 @@ def test_setup_skips_owner_member_overwrites(db_stubs, caplog):
 
 
 def test_log_role_ladder_marks_bot_top_role(db_stubs, caplog):
-    """The ladder log is the startup ground truth: one line per role in rank
-    order with the bot's top role marked, plus the MANAGE_ROLES bit --
-    whatever Discord's API actually sees, vs what the UI claims."""
+    """The ladder summary is the startup ground truth: one line with the
+    bot's top role, the MANAGE_ROLES bit, and exactly which roles rank above
+    the bot -- the only roles Discord's 50013 check can reject. The old
+    one-line-per-role dump (140+ lines per deploy) is gone."""
     guild = FakeGuild()
     bot_role = FakeRole("@bot", position=9)
     guild.me = FakeMe(bot_role, manage_roles=True)
@@ -516,16 +574,34 @@ def test_log_role_ladder_marks_bot_top_role(db_stubs, caplog):
     with caplog.at_level(logging.INFO):
         discord_utils.log_role_ladder(guild)
 
-    ladder = [r.message for r in caplog.records if "pos=" in r.message]
+    ladder = [r.message for r in caplog.records if "Role ladder" in r.message]
+    assert len(ladder) == 1
+    header = ladder[0]
+    assert "MANAGE_ROLES: ON" in header
+    assert "top role '@bot'" in header
+    assert "3 roles" in header
+    assert "no roles above bot" in header
+    # No per-role lines leak into the log any more.
+    assert [r.message for r in caplog.records if "pos=" in r.message] == []
+
+
+def test_log_role_ladder_flags_roles_above_bot(db_stubs, caplog):
+    """Roles ranked above the bot's top role are named in the summary line --
+    that list is the 50013 ground truth, so it must stay in the log."""
+    guild = FakeGuild()
+    bot_role = FakeRole("@bot", position=4)
+    guild.me = FakeMe(bot_role, manage_roles=True)
+    guild.roles.append(bot_role)  # real guild.roles includes the bot's own role
+    guild.add_role("Owner", position=5)
+    guild.add_role("Delta", position=3)
+
+    with caplog.at_level(logging.INFO):
+        discord_utils.log_role_ladder(guild)
+
     header = [r.message for r in caplog.records if "Role ladder" in r.message]
     assert len(header) == 1
-    assert "MANAGE_ROLES: ON" in header[0]
-    # Bot's top role (pos 9) first, Delta (pos 3) next, @everyone last.
-    assert ladder[0].startswith("  role pos=9")
-    assert "<== BOT TOP ROLE" in ladder[0]
-    assert ladder[1].startswith("  role pos=3")
-    assert "Delta" in ladder[1]
-    assert ladder[2].startswith("  role pos=0")
+    assert "role(s) ABOVE bot: 'Owner' (pos=5)" in header[0]
+    assert "'Delta'" not in header[0]
 
 
 def test_log_role_ladder_flags_missing_manage_roles(db_stubs, caplog):

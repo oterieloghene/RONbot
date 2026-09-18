@@ -34,16 +34,31 @@ def _normalize(s: str) -> str:
     return " ".join(s.split())
 
 
+def _is_text_channel(channel) -> bool:
+    """True for the one channel type a location can live in: a plain text
+    channel. Test stand-ins have no .type attribute and are treated as
+    text."""
+    return getattr(channel, "type", discord.ChannelType.text) == discord.ChannelType.text
+
+
 def get_channel(
     guild: discord.Guild, state: str, game_category: str, channel_name: str
 ) -> discord.abc.GuildChannel | None:
     """e.g. get_channel(guild, "Delta", "BORDER & ENTRY", "immigration-office")
     finds the channel named "immigration-office" under whichever category
-    normalizes to "delta border and entry"."""
+    normalizes to "delta border and entry".
+
+    Text channels only: a location is a channel players type in, and the
+    server keeps voice channels that reuse the location names (court-room,
+    city-hall) under the same categories. Matching one of those would bind
+    the location's join key to a voice channel, and Discord rejects a
+    send-messages overwrite on a voice channel (403)."""
     target = _normalize(f"{state} {game_category}")
     for category in guild.categories:
         if _normalize(category.name) == target:
-            return discord.utils.get(category.channels, name=channel_name)
+            for channel in category.channels:
+                if channel.name == channel_name and _is_text_channel(channel):
+                    return channel
     return None
 
 
@@ -109,34 +124,33 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
 
 
 def log_role_ladder(guild: discord.Guild) -> None:
-    """Log the full role ladder at startup, marking the bot's position.
+    """Log the role-ladder facts at startup in ONE compact line.
 
-    Ground truth for 50013 debugging: one line per role in rank order with
-    the bot's top role marked, plus the MANAGE_ROLES bit -- the permission
-    Discord actually checks when editing channel overwrites. If the log
-    disagrees with what Server Settings -> Roles shows in the UI, trust the
-    log: that is what the API sees.
+    Only what 50013 debugging actually needs: the bot's top role, the
+    MANAGE_ROLES bit (the permission Discord checks when editing channel
+    overwrites), and any roles ranking above the bot -- the only overwrites
+    the API can reject on rank grounds. The old one-line-per-role dump
+    (140+ roles on this server) made every Render deploy log too long to
+    read; if a full ladder dump is ever needed again, it can be fetched
+    from the API -- the startup log only needs the failure-relevant facts.
     """
     me = guild.me
     if me is None:
         return
     top = me.top_role
     mr = "ON" if me.guild_permissions.manage_roles else "OFF"
+    roles = sorted(guild.roles, key=lambda r: r.position, reverse=True)
+    higher = [role for role in roles if role > top]
+    if higher:
+        above = ", ".join(f"'{r.name}' (pos={r.position})" for r in higher)
+        higher_text = f"; {len(higher)} role(s) ABOVE bot: {above}"
+    else:
+        higher_text = "; no roles above bot"
     logging.info(
-        "Role ladder for %s: bot id %s, top role '%s' (%s), MANAGE_ROLES: %s",
-        guild.name, me.id, top.name, top.id, mr,
+        "Role ladder for %s: bot id %s, top role '%s' (%s), MANAGE_ROLES: %s, "
+        "%d roles total%s",
+        guild.name, me.id, top.name, top.id, mr, len(roles), higher_text,
     )
-    bot_role_ids = {r.id for r in getattr(me, "roles", [])}
-    for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-        mark = ""
-        if role.id == top.id:
-            mark = " <== BOT TOP ROLE"
-        elif role.id in bot_role_ids:
-            mark = " [bot role]"
-        logging.info(
-            "  role pos=%-4d %-32s (%s)%s",
-            role.position, role.name, role.id, mark,
-        )
 
 
 async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) -> bool:
@@ -279,8 +293,12 @@ async def sync_location_permissions(
     )
     for row in rows:
         channel = guild.get_channel(row["channel_id"])
-        if channel is None:
-            continue  # channel deleted or not in cache -- nothing to sync
+        # A stale row may still point at a voice channel that reused the
+        # location name (bound before get_channel learned to skip voice).
+        # An overwrite there can never succeed, so skip it until the next
+        # startup rebinds the location to its text channel.
+        if channel is None or not _is_text_channel(channel):
+            continue  # channel deleted or not a text channel -- nothing to sync
         await _apply_overwrite(
             channel, member,
             send_messages=row["id"] in writable,

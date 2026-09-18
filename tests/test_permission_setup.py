@@ -12,7 +12,10 @@ told to set.
 """
 
 import asyncio
+import logging
+import types
 
+import discord
 import pytest
 
 import config
@@ -44,10 +47,14 @@ LOCATION_ROWS = [
 class FakeRole:
     _next_id = 5000
 
-    def __init__(self, name):
+    def __init__(self, name, position=0):
         self.id = FakeRole._next_id
         FakeRole._next_id += 1
         self.name = name
+        self.position = position
+
+    def __gt__(self, other):
+        return self.position > other.position
 
     def __repr__(self):
         return f"<FakeRole {self.name}>"
@@ -61,8 +68,16 @@ class FakeChannel:
         FakeChannel._next_id += 1
         self.name = name
         self.permission_overwrites = {}
+        # targets whose set_permissions must 403 (a real server where the
+        # bot lacks Manage Channels, or is ranked below the target)
+        self.deny_targets = set()
 
     async def set_permissions(self, target, **kwargs):
+        if target in self.deny_targets:
+            response = types.SimpleNamespace(status=403, reason="Forbidden")
+            raise discord.Forbidden(
+                response, {"code": 50013, "message": "Missing Permissions"}
+            )
         self.permission_overwrites[target] = kwargs
 
 
@@ -90,6 +105,15 @@ class FakeMember:
         self.roles = []
 
 
+class FakeMe:
+    """guild.me -- the bot's own member object."""
+
+    def __init__(self, top_role, manage_channels=True):
+        self.name = "RONbot"
+        self.guild_permissions = types.SimpleNamespace(manage_channels=manage_channels)
+        self.top_role = top_role
+
+
 class FakeGuild:
     def __init__(self):
         self.roles = []
@@ -97,6 +121,8 @@ class FakeGuild:
         self.default_role = FakeRole("@everyone")
         self._members = {}
         self._channels = {}
+        self.name = f"{STATE} Roleplay"
+        self.me = None
 
         border = FakeCategory(f"{STATE} Border & Entry")
         self.bank = FakeCategory(f"{STATE} Bank PLC")
@@ -111,8 +137,8 @@ class FakeGuild:
         for ch in self.channels.values():
             self._channels[ch.id] = ch
 
-    def add_role(self, name):
-        role = FakeRole(name)
+    def add_role(self, name, position=0):
+        role = FakeRole(name, position=position)
         self.roles.append(role)
         return role
 
@@ -351,3 +377,95 @@ def test_setup_skips_players_not_in_guild(db_stubs):
 
     assert summary["skipped"] == 1
     assert summary["resynced"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Forbidden (50013) fault tolerance
+# ---------------------------------------------------------------------------
+
+def test_setup_continues_when_staff_overwrite_rejected(db_stubs, caplog):
+    """Discord 403s an overwrite when the bot ranks below the target role
+    (or lacks Manage Channels). setup must skip the rejected ones, count
+    them, and still land the rest -- never raise."""
+    guild = FakeGuild()
+    officer = guild.add_role(config.IMMIGRATION_OFFICER_ROLE_NAME)
+    marshal = guild.add_role("Chief Immigration Marshal")
+    for channel in guild.channels.values():
+        channel.deny_targets.add(officer)
+
+    with caplog.at_level(logging.WARNING):
+        summary = asyncio.run(discord_utils.setup_permissions(guild))
+
+    assert summary["denied"] == len(LOCATION_ROWS)
+    for channel in guild.channels.values():
+        assert officer not in channel.permission_overwrites
+        assert channel.permission_overwrites[marshal]["send_messages"] is True
+        assert channel.permission_overwrites[guild.default_role]["send_messages"] is False
+
+    rejected = [r for r in caplog.records if "Overwrite REJECTED" in r.message]
+    assert len(rejected) == len(LOCATION_ROWS)
+
+
+def test_setup_continues_when_everyone_lockdown_rejected(db_stubs):
+    """A rejected @everyone lockdown must not stop staff re-grants or the
+    per-member resync from running."""
+    guild = FakeGuild()
+    for channel in guild.channels.values():
+        channel.deny_targets.add(guild.default_role)
+    player = guild.add_member("runner")
+    db_stubs["player_rows"].append({
+        "discord_id": player.id,
+        "current_state": STATE,
+        "current_location_id": 1,
+    })
+
+    summary = asyncio.run(discord_utils.setup_permissions(guild))
+
+    assert summary["denied"] == len(LOCATION_ROWS)
+    for channel in guild.channels.values():
+        assert guild.default_role not in channel.permission_overwrites
+    office = guild.channels["immigration-office"]
+    assert office.permission_overwrites[player]["send_messages"] is True
+    assert summary["resynced"] == 1
+
+
+def test_sync_swallowed_forbidden_member_overwrite(db_stubs):
+    """A rejected per-member overwrite during a travel sync must not raise
+    -- the other channels of the same sync still get their overwrites."""
+    guild = FakeGuild()
+    player = guild.add_member("runner")
+    for row in db_stubs["location_rows"]:
+        row["channel_id"] = guild.channels[row["channel_name"]].id
+    guild.channels["banking-hall"].deny_targets.add(player)
+
+    asyncio.run(discord_utils.sync_location_permissions(guild, player, STATE, 1))
+
+    assert player not in guild.channels["banking-hall"].permission_overwrites
+    assert guild.channels["immigration-office"].permission_overwrites[player]["send_messages"] is True
+
+
+def test_setup_warns_when_bot_lacks_manage_channels(db_stubs, caplog):
+    """Missing Manage Channels is not fixable from code -- the warning must
+    tell the operator exactly where to click."""
+    guild = FakeGuild()
+    guild.me = FakeMe(FakeRole("@bot"), manage_channels=False)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(discord_utils.setup_permissions(guild))
+
+    records = [r for r in caplog.records if "NO Manage Channels" in r.message]
+    assert len(records) == 1
+
+
+def test_setup_warns_when_staff_role_ranks_above_bot(db_stubs, caplog):
+    """A staff role above the bot's top role guarantees 50013 on every
+    overwrite targeting it -- warn before they pile up."""
+    guild = FakeGuild()
+    guild.me = FakeMe(FakeRole("@bot", position=1))
+    guild.add_role(config.IMMIGRATION_OFFICER_ROLE_NAME, position=5)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(discord_utils.setup_permissions(guild))
+
+    records = [r for r in caplog.records if "ranks ABOVE" in r.message]
+    assert len(records) == 1

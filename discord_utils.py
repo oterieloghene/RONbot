@@ -14,6 +14,7 @@ needing a stored ID. Matching is normalized (case/punctuation-insensitive,
 typed with exact matching punctuation.
 """
 
+import logging
 import re
 
 import discord
@@ -55,6 +56,63 @@ STAFF_ROLE_NAMES = (
 )
 
 
+def _target_label(target) -> str:
+    name = getattr(target, "name", None)
+    return f"'{name}' ({target.id})" if name else f"({target.id})"
+
+
+def _check_overwrite_capacity(guild: discord.Guild) -> None:
+    """Log an actionable warning if the bot cannot manage channel overwrites.
+
+    Discord 403s (code 50013) an overwrite edit when either:
+      * the bot lacks Manage Channels on that channel, or
+      * the target role/member ranks above the bot's highest role.
+    Neither is fixable from code -- the operator must fix Server Settings ->
+    Roles -- so we say exactly what to change before the per-channel skips
+    start piling up.
+    """
+    me = guild.me
+    if me is None:
+        return
+    if not me.guild_permissions.manage_channels:
+        logging.warning(
+            "Permission setup for %s: bot has NO Manage Channels permission. "
+            "Grant it to the bot's role in Server Settings -> Roles, otherwise "
+            "every overwrite below will be skipped and channels stay as-is.",
+            guild.name,
+        )
+    top = me.top_role
+    for role_name in STAFF_ROLE_NAMES:
+        role = get_role(guild, role_name)
+        if role is not None and role > top:
+            logging.warning(
+                "Permission setup for %s: staff role '%s' ranks ABOVE the bot's "
+                "top role '%s' -- Discord will reject every overwrite on that "
+                "role. Drag the bot's role above it in Server Settings -> Roles.",
+                guild.name, role_name, top.name,
+            )
+
+
+async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) -> bool:
+    """Apply one permission overwrite; on 403 (50013) log and return False
+    instead of raising.
+
+    A single rejected overwrite must not abort the rest of the setup -- the
+    bindings and the overwrites Discord does allow still have to land.
+    """
+    try:
+        await channel.set_permissions(target, reason=reason, **overwrite_kwargs)
+        return True
+    except discord.Forbidden:
+        logging.warning(
+            "Overwrite REJECTED on #%s (%s) for %s: bot is missing Manage "
+            "Channels there, or its top role ranks below the target. Fix in "
+            "Server Settings -> Roles.",
+            channel.name, channel.id, _target_label(target),
+        )
+        return False
+
+
 async def setup_permissions(guild: discord.Guild) -> dict:
     """Idempotent permission setup, run once per bot startup (on_ready).
 
@@ -78,7 +136,8 @@ async def setup_permissions(guild: discord.Guild) -> dict:
     Every step is idempotent, so re-running on reconnect is safe.
     Returns a summary dict for logging.
     """
-    summary = {"bound": 0, "missing": 0, "channels": 0, "resynced": 0, "skipped": 0}
+    _check_overwrite_capacity(guild)
+    summary = {"bound": 0, "missing": 0, "channels": 0, "resynced": 0, "skipped": 0, "denied": 0}
 
     locations = await database.get_all_locations()
     location_channels = []
@@ -97,15 +156,17 @@ async def setup_permissions(guild: discord.Guild) -> dict:
         if role is None:
             continue
         for channel in location_channels:
-            await channel.set_permissions(
-                role, send_messages=True,
+            if not await _apply_overwrite(
+                channel, role, send_messages=True,
                 reason="RONbot startup: staff can run the game everywhere",
-            )
+            ):
+                summary["denied"] += 1
     for channel in location_channels:
-        await channel.set_permissions(
-            guild.default_role, send_messages=False,
+        if not await _apply_overwrite(
+            channel, guild.default_role, send_messages=False,
             reason="RONbot startup: writability follows travel",
-        )
+        ):
+            summary["denied"] += 1
     summary["channels"] = len(location_channels)
 
     for player in await database.get_players_needing_sync():
@@ -158,8 +219,8 @@ async def sync_location_permissions(
         channel = guild.get_channel(row["channel_id"])
         if channel is None:
             continue  # channel deleted or not in cache -- nothing to sync
-        await channel.set_permissions(
-            member,
+        await _apply_overwrite(
+            channel, member,
             send_messages=row["id"] in writable,
             reason="RONbot location sync: writability follows travel",
         )

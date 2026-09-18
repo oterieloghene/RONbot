@@ -16,7 +16,7 @@ def is_immigration_officer():
 
 class Immigration(commands.Cog):
     """Two-step process, both run by an Immigration Officer in the state's
-    Immigration Office channel:
+    Front Desk channel (staff-only -- arrivals can't see it):
 
       !name @player Full Name
           Names the player, manufactures and grants their "NIN-0001-{code}"
@@ -35,8 +35,8 @@ class Immigration(commands.Cog):
     def _state_cfg(self, state: str):
         return config.STATES.get(state)
 
-    def _immigration_office(self, guild: discord.Guild, state: str) -> discord.abc.GuildChannel | None:
-        return discord_utils.get_channel(guild, state, "BORDER & ENTRY", "immigration-office")
+    def _front_desk(self, guild: discord.Guild, state: str) -> discord.abc.GuildChannel | None:
+        return discord_utils.get_channel(guild, state, "BORDER & ENTRY", "front-desk")
 
     @commands.command(name="name")
     @is_immigration_officer()
@@ -60,12 +60,12 @@ class Immigration(commands.Cog):
             await ctx.send(f"Unknown state on record: {state}. Check config.py.")
             return
 
-        office_channel = self._immigration_office(ctx.guild, state)
-        if office_channel is None:
-            await ctx.send(f"Couldn't find {state}'s Immigration Office channel -- check the category name in Discord matches 'BORDER & ENTRY'.")
+        desk_channel = self._front_desk(ctx.guild, state)
+        if desk_channel is None:
+            await ctx.send(f"Couldn't find {state}'s Front Desk channel -- check the category name in Discord matches 'BORDER & ENTRY'.")
             return
-        if ctx.channel.id != office_channel.id:
-            await ctx.send(f"This has to be run in {state}'s Immigration Office channel.")
+        if ctx.channel.id != desk_channel.id:
+            await ctx.send(f"This has to be run in {state}'s Front Desk channel.")
             return
 
         nin_number = await database.allocate_nin_number()
@@ -123,12 +123,12 @@ class Immigration(commands.Cog):
             await ctx.send(f"Unknown state on record: {state}. Check config.py.")
             return
 
-        office_channel = self._immigration_office(ctx.guild, state)
-        if office_channel is None:
-            await ctx.send(f"Couldn't find {state}'s Immigration Office channel -- check the category name in Discord matches 'BORDER & ENTRY'.")
+        desk_channel = self._front_desk(ctx.guild, state)
+        if desk_channel is None:
+            await ctx.send(f"Couldn't find {state}'s Front Desk channel -- check the category name in Discord matches 'BORDER & ENTRY'.")
             return
-        if ctx.channel.id != office_channel.id:
-            await ctx.send(f"This has to be run in {state}'s Immigration Office channel.")
+        if ctx.channel.id != desk_channel.id:
+            await ctx.send(f"This has to be run in {state}'s Front Desk channel.")
             return
 
         await database.complete_immigration(member.id)
@@ -142,7 +142,7 @@ class Immigration(commands.Cog):
             await member.add_roles(state_role, reason="Immigration complete")
 
         await ctx.send(
-            f"{member.mention} fully immigrated -- now has full access to {state}."
+            f"{member.mention} ({player['player_id']}) fully immigrated -- now has full access to {state}."
         )
 
 

@@ -31,7 +31,23 @@ class Onboarding(commands.Cog):
         frees their NIN number back to the pool immediately (not deferred
         until someone else needs it) along with deleting the now-orphaned
         NIN role itself.
+
+        The departure announcement is posted first, using the state on
+        their record before it gets wiped -- a player who never picked a
+        destination has no state to announce from, so they're skipped.
         """
+        player = await database.get_player(member.id)
+        if player and player["current_state"]:
+            state = player["current_state"]
+            terminal_channel = discord_utils.get_channel(
+                member.guild, state, "BORDER & ENTRY", "arrival-terminal"
+            )
+            if terminal_channel:
+                await terminal_channel.send(
+                    f"{member.mention} just left the Republic of Nigeria. "
+                    f"Goodbye you will be missed."
+                )
+
         old_role_id = await database.reset_player_on_leave(member.id)
         if old_role_id:
             role = member.guild.get_role(old_role_id)

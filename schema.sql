@@ -5,7 +5,7 @@
 
 CREATE TABLE IF NOT EXISTS players (
     discord_id          BIGINT PRIMARY KEY,
-    player_id           TEXT UNIQUE,        -- e.g. "NIN-0001-LA", assigned at !name
+    player_id           TEXT UNIQUE,        -- e.g. "NIN-0001-LA", assigned at !immigrate
     player_name         TEXT,               -- given by the immigration officer
     current_state       TEXT,               -- Abuja / Lagos / Delta
     immigration_status  TEXT NOT NULL DEFAULT 'unarrived',
@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS locations (
     is_voice     BOOLEAN NOT NULL DEFAULT FALSE,
     role_gated   BOOLEAN NOT NULL DEFAULT FALSE,  -- TRUE if only specific roles (see location_roles) may post here
     channel_id   BIGINT,              -- Discord channel ID, filled in once channels exist
+    parent_location_id INTEGER REFERENCES locations(id) ON DELETE SET NULL,  -- set when this location is a SUBLOCATION of another (e.g. refugee-camp under immigration-office); NULL = top-level, walkable/drivable/bus stop
     UNIQUE (state, category, channel_name)
 );
 

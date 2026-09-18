@@ -73,7 +73,6 @@ import discord
 from discord.ext import commands
 
 import database
-from cogs.transportation import member_commissioner_state
 
 
 PHONE_TIMEOUT_SECONDS = 180

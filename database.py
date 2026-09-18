@@ -32,6 +32,13 @@ async def init_pool() -> None:
         async with _pool.acquire() as conn:
             await conn.execute(migration_002_path.read_text())
 
+    # Location hierarchy (parent_location_id) + wiring refugee-camp under
+    # immigration-office. See migration_003.sql's own header.
+    migration_003_path = pathlib.Path(__file__).parent / "migration_003.sql"
+    if migration_003_path.exists():
+        async with _pool.acquire() as conn:
+            await conn.execute(migration_003_path.read_text())
+
     transport_schema_path = pathlib.Path(__file__).parent / "schema_transportation.sql"
     if transport_schema_path.exists():
         async with _pool.acquire() as conn:
@@ -130,30 +137,70 @@ async def ensure_player_exists(discord_id: int) -> None:
 
 
 async def record_arrival(discord_id: int, state: str) -> None:
-    """Called when a player picks a destination in the select menu."""
-    await pool().execute(
-        """
-        UPDATE players
-        SET current_state = $2,
-            immigration_status = 'arrived',
-            arrived_at = now()
-        WHERE discord_id = $1
-        """,
-        discord_id,
+    """Called when a player picks a destination in the select menu.
+
+    Places the player at the state's immigration-office -- the only
+    top-level pre-immigration location -- so current_location_id starts
+    at immigration-office, never at refugee-camp (a sublocation of it,
+    reached by being present at the office, not by travelling there).
+    """
+    office_id = await get_immigration_office_location_id(state)
+    if office_id is not None:
+        await pool().execute(
+            """
+            UPDATE players
+            SET current_state = $2,
+                immigration_status = 'arrived',
+                current_location_id = $3,
+                arrived_at = now()
+            WHERE discord_id = $1
+            """,
+            discord_id,
+            state,
+            office_id,
+        )
+    else:
+        await pool().execute(
+            """
+            UPDATE players
+            SET current_state = $2,
+                immigration_status = 'arrived',
+                arrived_at = now()
+            WHERE discord_id = $1
+            """,
+            discord_id,
+            state,
+        )
+
+
+async def get_immigration_office_location_id(state: str) -> int | None:
+    """ID of the state's immigration-office location, or None if it hasn't
+    been seeded yet. This is where every player starts pre-immigration."""
+    row = await pool().fetchrow(
+        "SELECT id FROM locations WHERE state = $1 AND channel_name = 'immigration-office'",
         state,
     )
+    return row["id"] if row else None
+
+
+async def get_parent_map() -> dict[int, int | None]:
+    """location_id -> parent_location_id for the whole hierarchy.
+    Feeds permissions.is_travel_target / writable_location_ids."""
+    rows = await pool().fetch("SELECT id, parent_location_id FROM locations")
+    return {row["id"]: row["parent_location_id"] for row in rows}
 
 
 _NIN_ALLOCATION_LOCK_KEY = 872341  # arbitrary constant, just needs to be stable
 
 
 async def allocate_nin_number() -> int:
-    """Called by !name -- the Immigration Officer's first step. Hands out
+    """Called by !immigrate -- the final step after !name. Hands out
     the lowest currently-unused NIN number: pulls from freed_nin_numbers
     first (numbers released the instant a previous holder left the server,
     see reset_player_on_leave), and only mints a new one past the highest
     number ever assigned if the pool is empty. Locked with a transaction-
-    scoped advisory lock so two !name calls can't race for the same number.
+    scoped advisory lock so two !immigrate calls can't race for the same
+    number.
 
     Does NOT touch the players row -- the caller (cogs/immigration.py) needs
     this number first to build the NIN string and manufacture the Discord
@@ -177,34 +224,24 @@ async def allocate_nin_number() -> int:
             return (highest or 0) + 1
 
 
-async def finalize_naming(
-    discord_id: int, player_name: str, player_id: str, nin_number: int, role_id: int
-) -> None:
-    """Called by !name once the Immigration Officer's manufactured NIN role
-    has actually been created and assigned in Discord. Persists the name,
-    the formatted player_id (e.g. "NIN-0001-LA"), the underlying nin_number,
-    and the new role's Discord ID (kept so reset_player_on_leave can delete
-    it again if this player later leaves). Does NOT touch the Indigene role
-    or immigration_status beyond 'named' -- granting the Indigene role is
-    the caller's job, since that needs a discord.Member, not just a DB
-    connection. The arrival role is left alone here; !immigrate removes it
-    later."""
+async def finalize_naming(discord_id: int, player_name: str) -> None:
+    """Called by !name. Persists only the name: sets player_name, moves the
+    status 'arrived' -> 'named', and stamps named_at. Deliberately does NOT
+    touch player_id, nin_number, or nin_role_id -- !name grants no NIN number,
+    no player_id, and no NIN role. Those are minted and persisted by
+    !immigrate via complete_immigration(). The Indigene role is also the
+    caller's job (it needs a discord.Member, not just a DB connection); the
+    arrival role is left alone -- !immigrate removes it."""
     await pool().execute(
         """
         UPDATE players
         SET player_name = $2,
-            player_id = $3,
-            nin_number = $4,
-            nin_role_id = $5,
             immigration_status = 'named',
             named_at = now()
         WHERE discord_id = $1
         """,
         discord_id,
         player_name,
-        player_id,
-        nin_number,
-        role_id,
     )
 
 
@@ -261,18 +298,33 @@ async def reset_player_on_leave(discord_id: int) -> int | None:
             return row["nin_role_id"]
 
 
-async def complete_immigration(discord_id: int) -> None:
+async def complete_immigration(
+    discord_id: int, player_id: str, nin_number: int, role_id: int
+) -> None:
     """Called by !immigrate -- the final step, after !name. Marks the player
-    fully immigrated. Granting the general state role and removing the
-    arrival role is the caller's job (cogs/immigration.py)."""
+    fully immigrated and persists the identity that only this step mints:
+    the formatted player_id (e.g. "NIN-0001-LA"), the underlying nin_number,
+    and the manufactured NIN role's Discord ID (kept so reset_player_on_leave
+    can delete it if this player later leaves). named_at is already stamped
+    by !name; if it's somehow NULL (player immigrated without a naming
+    record), stamp it too so the audit trail isn't half-empty. Granting the
+    general state role, the Indigene role, and removing the arrival role is
+    the caller's job (cogs/immigration.py)."""
     await pool().execute(
         """
         UPDATE players
         SET immigration_status = 'immigrated',
-            immigrated_at = now()
+            immigrated_at = now(),
+            player_id = $2,
+            nin_number = $3,
+            nin_role_id = $4,
+            named_at = COALESCE(named_at, now())
         WHERE discord_id = $1
         """,
         discord_id,
+        player_id,
+        nin_number,
+        role_id,
     )
 
 

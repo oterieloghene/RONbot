@@ -19,14 +19,17 @@ class Immigration(commands.Cog):
     Front Desk channel (staff-only -- arrivals can't see it):
 
       !name @player Full Name
-          Names the player, manufactures and grants their "NIN-0001-{code}"
-          role, and grants "{State} Indigene". The arrival role is left
-          alone -- they can still only see the arrival-flow channels at
-          this point.
+          Records the player's name (status 'arrived' -> 'named') and grants
+          "{State} Indigene". Grants NO NIN number, NO player_id, and NO NIN
+          role -- those are minted by !immigrate. The arrival role is left
+          alone -- they can still only see the arrival-flow channels at this
+          point.
 
       !immigrate @player
-          Grants the general "{State}" location role (this is what unlocks
-          every other state-gated channel) and removes the arrival role.
+          Mints and grants the "NIN-0001-{code}" role, persists the NIN
+          number/player_id, grants the general "{State}" location role (this
+          is what unlocks every other state-gated channel), and removes the
+          arrival role.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -48,10 +51,56 @@ class Immigration(commands.Cog):
             return
 
         if player["immigration_status"] in ("named", "immigrated"):
+            pid = f" ({player['player_id']})" if player["player_id"] else ""
             await ctx.send(
-                f"{member.mention} has already been named **{player['player_name']}** "
-                f"({player['player_id']})."
+                f"{member.mention} has already been named **{player['player_name']}**{pid}."
             )
+            return
+
+        state = player["current_state"]
+        state_cfg = self._state_cfg(state)
+        if state_cfg is None:
+            await ctx.send(f"Unknown state on record: {state}. Check config.py.")
+            return
+
+        desk_channel = self._front_desk(ctx.guild, state)
+        if desk_channel is None:
+            await ctx.send(f"Couldn't find {state}'s Front Desk channel -- check the category name in Discord matches 'BORDER & ENTRY'.")
+            return
+        if ctx.channel.id != desk_channel.id:
+            await ctx.send(f"This has to be run in {state}'s Front Desk channel.")
+            return
+
+        # Name only. No NIN number, no player_id, no NIN role here --
+        # complete_immigration (via !immigrate) mints and persists all of
+        # those. Only the name and status move in this step.
+        await database.finalize_naming(member.id, player_name)
+
+        indigene_role = discord_utils.get_role(ctx.guild, state_cfg["indigene_role_name"])
+        if indigene_role:
+            await member.add_roles(indigene_role, reason="Named by Immigration Officer")
+
+        try:
+            await member.edit(nick=player_name)
+        except discord.Forbidden:
+            pass  # bot role may be below the member's -- not fatal
+
+        await ctx.send(
+            f"{member.mention} named **{player_name}** -- now a {state} Indigene. "
+            f"Run !immigrate once ready for a NIN number and full access."
+        )
+
+    @commands.command(name="immigrate")
+    @is_immigration_officer()
+    async def immigrate(self, ctx: commands.Context, member: discord.Member):
+        player = await database.get_player(member.id)
+
+        if player is None or player["immigration_status"] in ("unarrived", "arrived"):
+            await ctx.send(f"{member.mention} needs to be named first -- run !name.")
+            return
+
+        if player["immigration_status"] == "immigrated":
+            await ctx.send(f"{member.mention} has already been immigrated.")
             return
 
         state = player["current_state"]
@@ -86,52 +135,9 @@ class Immigration(commands.Cog):
         nin_role = await ctx.guild.create_role(
             name=player_id, reason=f"NIN assigned to {member} by Immigration Officer"
         )
-        await member.add_roles(nin_role, reason="Named by Immigration Officer")
+        await member.add_roles(nin_role, reason="Immigrated -- NIN issued")
 
-        await database.finalize_naming(member.id, player_name, player_id, nin_number, nin_role.id)
-
-        indigene_role = discord_utils.get_role(ctx.guild, state_cfg["indigene_role_name"])
-        if indigene_role:
-            await member.add_roles(indigene_role, reason="Named by Immigration Officer")
-
-        try:
-            await member.edit(nick=player_name)
-        except discord.Forbidden:
-            pass  # bot role may be below the member's -- not fatal
-
-        await ctx.send(
-            f"{member.mention} named **{player_name}** ({player_id}) -- "
-            f"now a {state} Indigene. Run !immigrate once ready to give full access."
-        )
-
-    @commands.command(name="immigrate")
-    @is_immigration_officer()
-    async def immigrate(self, ctx: commands.Context, member: discord.Member):
-        player = await database.get_player(member.id)
-
-        if player is None or player["immigration_status"] in ("unarrived", "arrived"):
-            await ctx.send(f"{member.mention} needs to be named first -- run !name.")
-            return
-
-        if player["immigration_status"] == "immigrated":
-            await ctx.send(f"{member.mention} has already been immigrated.")
-            return
-
-        state = player["current_state"]
-        state_cfg = self._state_cfg(state)
-        if state_cfg is None:
-            await ctx.send(f"Unknown state on record: {state}. Check config.py.")
-            return
-
-        desk_channel = self._front_desk(ctx.guild, state)
-        if desk_channel is None:
-            await ctx.send(f"Couldn't find {state}'s Front Desk channel -- check the category name in Discord matches 'BORDER & ENTRY'.")
-            return
-        if ctx.channel.id != desk_channel.id:
-            await ctx.send(f"This has to be run in {state}'s Front Desk channel.")
-            return
-
-        await database.complete_immigration(member.id)
+        await database.complete_immigration(member.id, player_id, nin_number, nin_role.id)
 
         arrival_role = discord_utils.get_role(ctx.guild, f"{state} Arrival")
         state_role = discord_utils.get_role(ctx.guild, state)
@@ -142,7 +148,7 @@ class Immigration(commands.Cog):
             await member.add_roles(state_role, reason="Immigration complete")
 
         await ctx.send(
-            f"{member.mention} ({player['player_id']}) fully immigrated -- now has full access to {state}."
+            f"{member.mention} ({player_id}) fully immigrated -- now has full access to {state}."
         )
 
 

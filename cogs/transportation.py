@@ -35,7 +35,7 @@ class InsufficientTreasuryFunds(Exception):
 
 
 async def debit_treasury(state: str, amount: float) -> None:
-    row = await database.pool().fetchrow(
+    await database.pool().fetchrow(
         """
         INSERT INTO state_accounts (state, account_type, balance)
         VALUES ($1, 'treasury', 0)
@@ -100,6 +100,7 @@ async def list_route_stops(route: object) -> list:
             """
             SELECT * FROM locations
             WHERE state = $1 AND category = ANY($2::text[])
+              AND parent_location_id IS NULL
             ORDER BY id
             """,
             route["state"],

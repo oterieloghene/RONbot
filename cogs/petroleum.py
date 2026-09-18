@@ -79,7 +79,6 @@ import database
 import discord_utils
 import cogs.cars as cars_module
 from cogs.transportation import (
-    STATE_ROLE_LABEL,
     InsufficientTreasuryFunds,
     credit_ministry_of_commerce,
     debit_treasury,

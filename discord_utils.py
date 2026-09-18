@@ -65,7 +65,10 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
     """Log an actionable warning if the bot cannot manage channel overwrites.
 
     Discord 403s (code 50013) an overwrite edit when either:
-      * the bot lacks Manage Channels on that channel, or
+      * the bot lacks Manage Roles on that channel -- the permission the
+        API actually checks for editing channel permission overwrites
+        (NOT Manage Channel Permissions, which only governs channel
+        create/rename/delete -- a classic confusion), or
       * the target role/member ranks above the bot's highest role.
     Neither is fixable from code -- the operator must fix Server Settings ->
     Roles -- so we say exactly what to change before the per-channel skips
@@ -74,11 +77,15 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
     me = guild.me
     if me is None:
         return
-    if not me.guild_permissions.manage_channels:
+    if not me.guild_permissions.manage_roles:
         logging.warning(
-            "Permission setup for %s: bot has NO Manage Channels permission. "
-            "Grant it to the bot's role in Server Settings -> Roles, otherwise "
-            "every overwrite below will be skipped and channels stay as-is.",
+            "Permission setup for %s: bot has NO Manage Roles permission. "
+            "That is the permission Discord checks when editing channel "
+            "overwrites (NOT Manage Channel Permissions -- the one that "
+            "has been on from the start). Grant 'Manage Roles' to the bot's "
+            "role in Server Settings -> Roles -> [bot role] -> Advanced, "
+            "otherwise every overwrite below will be rejected with 50013 "
+            "and channels stay as-is.",
             guild.name,
         )
     top = me.top_role
@@ -106,8 +113,9 @@ async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) 
     except discord.Forbidden:
         logging.warning(
             "Overwrite REJECTED on #%s (%s) for %s: bot is missing Manage "
-            "Channels there, or its top role ranks below the target. Fix in "
-            "Server Settings -> Roles.",
+            "Roles there (the permission Discord checks for overwrites -- "
+            "not Manage Channel Permissions), or its top role ranks below "
+            "the target. Fix in Server Settings -> Roles.",
             channel.name, channel.id, _target_label(target),
         )
         return False

@@ -108,9 +108,9 @@ class FakeMember:
 class FakeMe:
     """guild.me -- the bot's own member object."""
 
-    def __init__(self, top_role, manage_channels=True):
+    def __init__(self, top_role, manage_roles=True):
         self.name = "RONbot"
-        self.guild_permissions = types.SimpleNamespace(manage_channels=manage_channels)
+        self.guild_permissions = types.SimpleNamespace(manage_roles=manage_roles)
         self.top_role = top_role
 
 
@@ -444,16 +444,16 @@ def test_sync_swallowed_forbidden_member_overwrite(db_stubs):
     assert guild.channels["immigration-office"].permission_overwrites[player]["send_messages"] is True
 
 
-def test_setup_warns_when_bot_lacks_manage_channels(db_stubs, caplog):
-    """Missing Manage Channels is not fixable from code -- the warning must
+def test_setup_warns_when_bot_lacks_manage_roles(db_stubs, caplog):
+    """Missing Manage Roles is not fixable from code -- the warning must
     tell the operator exactly where to click."""
     guild = FakeGuild()
-    guild.me = FakeMe(FakeRole("@bot"), manage_channels=False)
+    guild.me = FakeMe(FakeRole("@bot"), manage_roles=False)
 
     with caplog.at_level(logging.WARNING):
         asyncio.run(discord_utils.setup_permissions(guild))
 
-    records = [r for r in caplog.records if "NO Manage Channels" in r.message]
+    records = [r for r in caplog.records if "NO Manage Roles" in r.message]
     assert len(records) == 1
 
 

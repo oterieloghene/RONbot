@@ -48,7 +48,8 @@ IMMIGRATION_OFFICER_ROLE_NAME = "Immigration Officer"
 #                         roles -- see cogs/banking.py's STATE_ROLE_LABEL).
 #
 # "state_code"          -> the suffix used when the bot manufactures a
-#                         player's NIN role at !name time, e.g. "NIN-0001-LA".
+#                         player's NIN role at !immigrate time, e.g.
+#                         "NIN-0001-LA".
 #                         Spelled out explicitly for the same reason as
 #                         above -- Abuja's is "FCT", not "AB".
 #

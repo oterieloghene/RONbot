@@ -475,6 +475,17 @@ class Cars(commands.Cog):
         if destination is None:
             raise VehicleError(f"Unknown destination `{destination_channel}` in {destination_state.title()}.")
 
+        if destination["parent_location_id"] is not None:
+            parent = await database.pool().fetchrow(
+                "SELECT channel_name FROM locations WHERE id = $1",
+                destination["parent_location_id"],
+            )
+            parent_name = parent["channel_name"] if parent else "another location"
+            raise VehicleError(
+                f"`{destination_channel}` is a sublocation of `{parent_name}` -- you can't drive there "
+                "directly. Travel to its parent location instead."
+            )
+
         is_interstate = destination_state_upper != origin["state"]
 
         if is_interstate:

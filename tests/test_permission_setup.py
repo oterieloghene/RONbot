@@ -458,14 +458,18 @@ def test_setup_warns_when_bot_lacks_manage_roles(db_stubs, caplog):
 
 
 def test_setup_warns_when_staff_role_ranks_above_bot(db_stubs, caplog):
-    """A staff role above the bot's top role guarantees 50013 on every
-    overwrite targeting it -- warn before they pile up."""
+    """A role above the bot's top role guarantees 50013 on every overwrite
+    targeting it (staff re-grant AND per-player sync) -- the one consolidated
+    warning must name the offending role."""
     guild = FakeGuild()
     guild.me = FakeMe(FakeRole("@bot", position=1))
     guild.add_role(config.IMMIGRATION_OFFICER_ROLE_NAME, position=5)
+    guild.add_role("Delta", position=3)
 
     with caplog.at_level(logging.WARNING):
         asyncio.run(discord_utils.setup_permissions(guild))
 
-    records = [r for r in caplog.records if "ranks ABOVE" in r.message]
+    records = [r for r in caplog.records if "rank ABOVE" in r.message]
     assert len(records) == 1
+    assert config.IMMIGRATION_OFFICER_ROLE_NAME in records[0].message
+    assert "Delta" in records[0].message

@@ -68,8 +68,12 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
       * the bot lacks Manage Roles on that channel -- the permission the
         API actually checks for editing channel permission overwrites
         (NOT Manage Channel Permissions, which only governs channel
-        create/rename/delete -- a classic confusion), or
-      * the target role/member ranks above the bot's highest role.
+        create/rename/delete), or
+      * the target role/member ranks above the bot's highest role in the
+        server's role list -- the usual culprit when every permission bit
+        is already on: overwrites that target a state role (Delta, ...) or
+        a player whose top role sits above the bot are all rejected, on
+        every channel, no matter how the individual channels are gated.
     Neither is fixable from code -- the operator must fix Server Settings ->
     Roles -- so we say exactly what to change before the per-channel skips
     start piling up.
@@ -89,15 +93,19 @@ def _check_overwrite_capacity(guild: discord.Guild) -> None:
             guild.name,
         )
     top = me.top_role
-    for role_name in STAFF_ROLE_NAMES:
-        role = get_role(guild, role_name)
-        if role is not None and role > top:
-            logging.warning(
-                "Permission setup for %s: staff role '%s' ranks ABOVE the bot's "
-                "top role '%s' -- Discord will reject every overwrite on that "
-                "role. Drag the bot's role above it in Server Settings -> Roles.",
-                guild.name, role_name, top.name,
-            )
+    higher = [role for role in guild.roles if role > top]
+    if higher:
+        names = ", ".join(f"'{role.name}'" for role in higher)
+        logging.warning(
+            "Permission setup for %s: these roles rank ABOVE the bot's top "
+            "role '%s': %s. Discord rejects with 50013 every overwrite "
+            "that targets a role above the bot's top role -- or a member "
+            "whose top role does -- so the staff re-grant and the "
+            "per-player travel sync both fail on every channel until the "
+            "bot's role sits above them. Drag the bot's role up in Server "
+            "Settings -> Roles (admin/owner roles may stay above it).",
+            guild.name, top.name, names,
+        )
 
 
 async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) -> bool:
@@ -111,12 +119,19 @@ async def _apply_overwrite(channel, target, *, reason: str, **overwrite_kwargs) 
         await channel.set_permissions(target, reason=reason, **overwrite_kwargs)
         return True
     except discord.Forbidden:
+        top_role = getattr(getattr(target, "top_role", None), "name", None)
+        rank_hint = (
+            f" -- '{top_role}' ranks above the bot's top role; drag the bot's "
+            f"role above it in Server Settings -> Roles"
+            if top_role
+            else " -- check Manage Roles on this channel/category too"
+        )
         logging.warning(
-            "Overwrite REJECTED on #%s (%s) for %s: bot is missing Manage "
-            "Roles there (the permission Discord checks for overwrites -- "
-            "not Manage Channel Permissions), or its top role ranks below "
-            "the target. Fix in Server Settings -> Roles.",
-            channel.name, channel.id, _target_label(target),
+            "Overwrite REJECTED (50013) on #%s (%s) for %s: the bot's top "
+            "role ranks below the overwrite target%s. Every sync that "
+            "targets this role/member will keep failing until the role "
+            "ladder is fixed.",
+            channel.name, channel.id, _target_label(target), rank_hint,
         )
         return False
 

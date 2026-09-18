@@ -9,8 +9,9 @@ CREATE TABLE IF NOT EXISTS players (
     player_name         TEXT,               -- given by the immigration officer
     current_state       TEXT,               -- Abuja / Lagos / Delta
     immigration_status  TEXT NOT NULL DEFAULT 'unarrived',
-                         -- 'unarrived' -> 'arrived' -> 'immigrated'
+                         -- 'unarrived' -> 'arrived' -> 'named' -> 'immigrated'
     arrived_at          TIMESTAMPTZ,
+    named_at            TIMESTAMPTZ,
     immigrated_at        TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -46,12 +47,19 @@ CREATE TABLE IF NOT EXISTS roles (
     role_id  BIGINT              -- Discord role ID, filled in once the role exists in the server
 );
 
--- Which role(s) are associated with which location. A location can have several
--- (e.g. holding-cell -> Police Officer, Jailed, Arrested); a role can apply to
--- several locations. role_gated on `locations` is the actual enforcement switch --
--- this table is what it's TRUE *because of*.
+-- Which role(s) grant access to which location. role_gated on `locations` is
+-- the actual enforcement switch -- this table is what it's TRUE *because of*.
+--
+-- group_id expresses AND/OR: rows sharing a (location_id, group_id) must ALL
+-- be held by the member (AND); different group_ids are alternatives, any one
+-- of which is sufficient (OR). E.g. holding-cell might be:
+--   group 1: Police Officer + Delta Employee   (both required)
+--   group 2: Jailed                            (alone is enough)
+--   group 3: Arrested                          (alone is enough)
+-- A plain single-role requirement (most locations) is just a group of one.
 CREATE TABLE IF NOT EXISTS location_roles (
     location_id  INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    group_id     INTEGER NOT NULL,
     role_id      INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
-    PRIMARY KEY (location_id, role_id)
+    PRIMARY KEY (location_id, group_id, role_id)
 );

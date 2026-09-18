@@ -190,6 +190,25 @@ async def get_parent_map() -> dict[int, int | None]:
     return {row["id"]: row["parent_location_id"] for row in rows}
 
 
+async def get_state_location_channels(state: str) -> list[asyncpg.Record]:
+    """Every location in `state` that has a Discord channel mapped.
+
+    Returns (id, channel_id, parent_location_id) rows -- exactly what
+    discord_utils.sync_location_permissions needs to decide, per channel,
+    whether the player's current location (or one of its sublocations)
+    matches. Locations without a channel_id can't be granted overwrites,
+    so they're excluded."""
+    return await pool().fetch(
+        """
+        SELECT id, channel_id, parent_location_id
+        FROM locations
+        WHERE state = $1 AND channel_id IS NOT NULL
+        ORDER BY id
+        """,
+        state,
+    )
+
+
 _NIN_ALLOCATION_LOCK_KEY = 872341  # arbitrary constant, just needs to be stable
 
 

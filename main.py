@@ -20,6 +20,12 @@ intents.message_content = True  # required to read !name, !immigrate, !dep etc.
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Bumped every time command behavior changes. If a deployed bot logs any
+# other marker, the running process is executing stale code -- redeploy from
+# the latest main and fully restart the process (kill the old PID, don't
+# just reload). Compare this against the PR that last changed !name/!immigrate.
+BOT_BUILD = "2025-01-15-command-scope-fix"
+
 INITIAL_COGS = [
     "cogs.onboarding",
     "cogs.immigration",
@@ -33,7 +39,7 @@ INITIAL_COGS = [
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} ({bot.user.id})")
+    print(f"RONbot build {BOT_BUILD} | logged in as {bot.user} ({bot.user.id})")
     synced = await bot.tree.sync()
     print(f"Synced {len(synced)} slash command(s)")
 
@@ -59,6 +65,7 @@ async def start_web_server() -> None:
 
 
 async def main():
+    print(f"Starting RONbot build {BOT_BUILD}")
     await database.init_pool()
     await start_web_server()
     async with bot:

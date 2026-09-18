@@ -80,6 +80,19 @@ class Onboarding(commands.Cog):
         await database.ensure_player_exists(member.id)
         await database.record_arrival(member.id, state)
 
+        # record_arrival placed the player at the state's immigration-office.
+        # The "{State} Arrival" role just made that state's channels VISIBLE;
+        # writability must follow location, not role membership. Sync
+        # per-member overwrites across the whole state so the player can only
+        # type where they actually are (office + sublocations, nothing else).
+        player = await database.get_player(member.id)
+        await discord_utils.sync_location_permissions(
+            member.guild,
+            member,
+            state,
+            current_location_id=player["current_location_id"] if player else None,
+        )
+
         terminal_channel = discord_utils.get_channel(
             member.guild, state, "BORDER & ENTRY", "arrival-terminal"
         )

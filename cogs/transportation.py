@@ -572,8 +572,12 @@ class Transportation(commands.Cog):
             bus["id"],
         )
         if member is not None:
-            await self._revoke_channel(member, location["channel_id"])
-            await self._grant_read_only(member, location["channel_id"])
+            # Boarding = in transit: no location is current until alighting.
+            # Re-sync the whole state so every visible channel goes
+            # read-only, not just the boarding stop.
+            await discord_utils.sync_location_permissions(
+                member.guild, member, state, current_location_id=None
+            )
         return True
 
     async def _alight(self, booking, location, fare: float, state: str) -> None:
@@ -589,14 +593,23 @@ class Transportation(commands.Cog):
 
         member = self._get_member(state, booking["player_discord_id"])
         if member is not None:
-            await self._grant_full_access(member, location["channel_id"])
+            # Alighting = location changed: make the destination state's
+            # channels match the new location (destination writable, all
+            # other visible channels read-only).
+            await discord_utils.sync_location_permissions(
+                member.guild, member, state, current_location_id=location["id"]
+            )
 
     async def _move_transit_view(self, discord_id: int, from_location, to_location) -> None:
         member = self._get_member(from_location["state"], discord_id)
         if member is None:
             return
-        await self._revoke_channel(member, from_location["channel_id"])
-        await self._grant_read_only(member, to_location["channel_id"])
+        # In transit: no location is current, so the whole origin state's
+        # channels stay read-only (the destination only becomes visible via
+        # the destination state's role, granted on arrival).
+        await discord_utils.sync_location_permissions(
+            member.guild, member, from_location["state"], current_location_id=None
+        )
 
     def _get_member(self, state: str, discord_id: int) -> discord.Member | None:
         for guild in self.bot.guilds:
@@ -604,27 +617,6 @@ class Transportation(commands.Cog):
             if member is not None:
                 return member
         return None
-
-    async def _revoke_channel(self, member: discord.Member, channel_id: int | None) -> None:
-        if not channel_id:
-            return
-        channel = self.bot.get_channel(channel_id)
-        if channel is not None:
-            await channel.set_permissions(member, overwrite=None)
-
-    async def _grant_read_only(self, member: discord.Member, channel_id: int | None) -> None:
-        if not channel_id:
-            return
-        channel = self.bot.get_channel(channel_id)
-        if channel is not None:
-            await channel.set_permissions(member, view_channel=True, send_messages=False)
-
-    async def _grant_full_access(self, member: discord.Member, channel_id: int | None) -> None:
-        if not channel_id:
-            return
-        channel = self.bot.get_channel(channel_id)
-        if channel is not None:
-            await channel.set_permissions(member, view_channel=True, send_messages=True)
 
 
 async def setup(bot: commands.Bot):

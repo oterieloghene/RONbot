@@ -147,6 +147,14 @@ class Immigration(commands.Cog):
         if state_role:
             await member.add_roles(state_role, reason="Immigration complete")
 
+        # The state role just made every state-gated channel VISIBLE; it must
+        # NOT make them writable. Re-sync per-member overwrites across the
+        # whole state so the player can only type where they actually are
+        # (immigration-office + sublocations pre-travel, read-only elsewhere).
+        await discord_utils.sync_location_permissions(
+            ctx.guild, member, state, current_location_id=player.get("current_location_id")
+        )
+
         await ctx.send(
             f"{member.mention} ({player_id}) fully immigrated -- now has full access to {state}."
         )

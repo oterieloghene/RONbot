@@ -43,6 +43,10 @@ class FakeChannel:
         self.id = FakeChannel._next_id
         FakeChannel._next_id += 1
         self.name = name
+        self.permission_overwrites = {}
+
+    async def set_permissions(self, target, **kwargs):
+        self.permission_overwrites[target] = kwargs
 
 
 class FakeCategory:
@@ -73,6 +77,13 @@ class FakeGuild:
             config.IMMIGRATION_OFFICER_ROLE_NAME,
         ):
             self.add_role(role_name)
+
+    def get_channel(self, channel_id):
+        for category in self.categories:
+            for channel in category.channels:
+                if channel.id == channel_id:
+                    return channel
+        return None
 
     def add_role(self, name):
         role = FakeRole(name)
@@ -141,13 +152,14 @@ STATE = "Lagos"
 PLAYER_ID = "NIN-0007-LA"
 
 
-def make_setup(player_row):
+def make_setup(player_row, state_location_channels=None):
     """Build a (cog, ctx, member, calls) tuple wired against a stubbed DB."""
     calls = {
         "get_player": [],
         "finalize_naming": [],
         "complete_immigration": [],
         "allocate_nin_number": [],
+        "get_state_location_channels": [],
     }
 
     async def fake_get_player(discord_id):
@@ -164,10 +176,15 @@ def make_setup(player_row):
         calls["allocate_nin_number"].append(1)
         return 7
 
+    async def fake_get_state_location_channels(state):
+        calls["get_state_location_channels"].append(state)
+        return state_location_channels or []
+
     database.get_player = fake_get_player
     database.finalize_naming = fake_finalize_naming
     database.complete_immigration = fake_complete_immigration
     database.allocate_nin_number = fake_allocate_nin_number
+    database.get_state_location_channels = fake_get_state_location_channels
 
     guild = FakeGuild(STATE)
     officer = FakeMember(guild, "officer", roles=[guild.add_role(config.IMMIGRATION_OFFICER_ROLE_NAME)])
@@ -188,7 +205,13 @@ def db_stubs():
 
     saved = {
         name: getattr(db_mod, name)
-        for name in ("get_player", "finalize_naming", "complete_immigration", "allocate_nin_number")
+        for name in (
+            "get_player",
+            "finalize_naming",
+            "complete_immigration",
+            "allocate_nin_number",
+            "get_state_location_channels",
+        )
     }
     yield
     for name, fn in saved.items():
@@ -390,3 +413,127 @@ def test_immigrate_rejects_already_immigrated(db_stubs):
     assert calls["complete_immigration"] == []
     assert ctx.guild.created_roles == []
     assert "has already been immigrated" in ctx.sent[0]
+# ---------------------------------------------------------------------------
+# Writability follows travel: after !immigrate the player can type at the
+# immigration-office (and its sublocation refugee-camp) only; every other
+# channel that just became VISIBLE via the state role must be left
+# read-only until the player actually travels.
+# ---------------------------------------------------------------------------
+
+def make_state_location_channels(guild):
+    """Build location channels under state categories, matched to stub rows."""
+    border = guild.categories[0]  # "{STATE} Border & Entry", holds front-desk
+    office = border.add_channel("immigration-office")
+    camp = border.add_channel("refugee-camp")
+    services = FakeCategory(f"{STATE} Services")
+    hall = services.add_channel("banking-hall")
+    guild.categories.append(services)
+    rows = [
+        {"id": 10, "channel_id": office.id, "parent_location_id": None},
+        {"id": 11, "channel_id": camp.id, "parent_location_id": 10},
+        {"id": 12, "channel_id": hall.id, "parent_location_id": None},
+    ]
+    return rows, {"immigration-office": office, "refugee-camp": camp, "banking-hall": hall}
+
+
+def test_immigrate_keeps_newly_visible_channels_read_only(db_stubs):
+    import asyncio
+
+    cog, ctx, member, calls = make_setup(
+        {
+            "immigration_status": "named",
+            "current_state": STATE,
+            "player_id": None,
+            "player_name": "Full Name",
+            "current_location_id": 10,  # standing at the immigration-office
+        }
+    )
+    # Build the location channels on the SAME guild the callback will use.
+    guild = ctx.guild
+    rows, channels = make_state_location_channels(guild)
+
+    async def fake_get_state_location_channels(state):
+        calls["get_state_location_channels"].append(state)
+        return rows
+
+    database.get_state_location_channels = fake_get_state_location_channels
+
+    cmd = get_cmd(cog, "immigrate")
+    asyncio.run(cmd.callback(cog, ctx, member))
+
+    # The office and its sublocation are writable...
+    assert channels["immigration-office"].permission_overwrites[member]["send_messages"] is True
+    assert channels["refugee-camp"].permission_overwrites[member]["send_messages"] is True
+    # ...while everything else that just became visible is read-only.
+    assert channels["banking-hall"].permission_overwrites[member]["send_messages"] is False
+    assert calls["get_state_location_channels"] == [STATE]
+
+
+def test_travel_to_banking_hall_moves_writability(db_stubs):
+    """sync_location_permissions is the single writer of send overwrites.
+
+    After the player travels to banking-hall, that channel becomes writable
+    and the immigration-office + refugee-camp flip back to read-only.
+    """
+    import asyncio
+
+    guild = FakeGuild(STATE)
+    rows, channels = make_state_location_channels(guild)
+
+    async def fake_get_state_location_channels(state):
+        return rows
+
+    database.get_state_location_channels = fake_get_state_location_channels
+
+    member = FakeMember(guild, "arrival", roles=[guild.add_role(f"{STATE} Arrival")])
+
+    async def run_sync(location_id):
+        await discord_utils.sync_location_permissions(
+            guild, member, STATE, current_location_id=location_id
+        )
+
+    # In transit: no current location -> read-only everywhere.
+    asyncio.run(run_sync(None))
+    assert channels["immigration-office"].permission_overwrites[member]["send_messages"] is False
+    assert channels["refugee-camp"].permission_overwrites[member]["send_messages"] is False
+    assert channels["banking-hall"].permission_overwrites[member]["send_messages"] is False
+
+    # Arrived at banking-hall (id 12).
+    asyncio.run(run_sync(12))
+    assert channels["banking-hall"].permission_overwrites[member]["send_messages"] is True
+    assert channels["immigration-office"].permission_overwrites[member]["send_messages"] is False
+    assert channels["refugee-camp"].permission_overwrites[member]["send_messages"] is False
+
+
+def test_immigrate_with_no_location_leaves_everything_read_only(db_stubs):
+    """A freshly-immigrated player whose row has no current_location_id yet
+    gets the state role (visibility) but can type nowhere until onboarding
+    places them at the immigration-office."""
+    import asyncio
+
+    cog, ctx, member, calls = make_setup(
+        {
+            "immigration_status": "named",
+            "current_state": STATE,
+            "player_id": None,
+            "player_name": "Full Name",
+            "current_location_id": None,
+        }
+    )
+    guild = ctx.guild
+    rows, channels = make_state_location_channels(guild)
+
+    async def _slc(state):
+        calls["get_state_location_channels"].append(state)
+        return rows
+
+    database.get_state_location_channels = _slc
+
+    cmd = get_cmd(cog, "immigrate")
+    asyncio.run(cmd.callback(cog, ctx, member))
+
+    for channel in channels.values():
+        assert channel.permission_overwrites[member]["send_messages"] is False
+    # The state role still got added, so the channels are visible.
+    state_role = discord_utils.get_role(guild, STATE)
+    assert state_role in member.roles

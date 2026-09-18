@@ -574,7 +574,12 @@ class Cars(commands.Cog):
                 datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=cooldown_hours),
             )
 
-        await self._revoke_channel(ctx.author, origin["channel_id"])
+        # Departure = in transit: no location is current until arrival.
+        # Re-sync the whole origin state so every visible channel goes
+        # read-only, not just the one they left.
+        await discord_utils.sync_location_permissions(
+            ctx.author.guild, ctx.author, origin["state"], current_location_id=None
+        )
 
         eta_text = _format_duration(elapsed_seconds)
         await ctx.send(
@@ -647,7 +652,15 @@ class Cars(commands.Cog):
                     if member is not None:
                         await self._swap_state_role(member, old_state, trip["breakdown_state"].upper())
                 if member is not None:
-                    await self._grant_full_access(member, repair_location["channel_id"])
+                    # Stranded at the repair shop in the breakdown state: sync
+                    # that state so only the auto-repair channel (and any
+                    # sublocations of it) are writable.
+                    await discord_utils.sync_location_permissions(
+                        member.guild,
+                        member,
+                        trip["breakdown_state"].upper(),
+                        current_location_id=repair_location["id"],
+                    )
 
             if member is not None:
                 try:
@@ -682,7 +695,12 @@ class Cars(commands.Cog):
                 if member is not None:
                     await self._swap_state_role(member, old_state, destination["state"])
             if member is not None:
-                await self._grant_full_access(member, destination["channel_id"])
+                await discord_utils.sync_location_permissions(
+                    member.guild,
+                    member,
+                    destination["state"],
+                    current_location_id=destination["id"],
+                )
                 try:
                     await member.send(
                         f"You've arrived at {destination['state'].title()} {destination['channel_name']}."
@@ -698,20 +716,6 @@ class Cars(commands.Cog):
             if member is not None:
                 return member
         return None
-
-    async def _revoke_channel(self, member: discord.Member, channel_id: int | None) -> None:
-        if not channel_id:
-            return
-        channel = self.bot.get_channel(channel_id)
-        if channel is not None:
-            await channel.set_permissions(member, overwrite=None)
-
-    async def _grant_full_access(self, member: discord.Member, channel_id: int | None) -> None:
-        if not channel_id:
-            return
-        channel = self.bot.get_channel(channel_id)
-        if channel is not None:
-            await channel.set_permissions(member, view_channel=True, send_messages=True)
 
 
 async def setup(bot: commands.Bot):

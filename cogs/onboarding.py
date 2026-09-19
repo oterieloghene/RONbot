@@ -1,9 +1,13 @@
+import logging
+
 import discord
 from discord.ext import commands
 
 import config
 import database
 import discord_utils
+
+logger = logging.getLogger(__name__)
 
 
 class Onboarding(commands.Cog):
@@ -70,12 +74,61 @@ class Onboarding(commands.Cog):
                 await self._handle_arrival(after, state, state_cfg)
                 break  # a member only picks one destination
 
+    @staticmethod
+    def _stale_state_roles(guild: discord.Guild, state: str) -> list[discord.Role]:
+        """Every state role on a member EXCEPT the fresh "{state} Arrival"
+        role that triggered this arrival. That covers leftover "{State}"
+        settlement roles and other states' "{State} Arrival" roles from a
+        previous life -- the two role names that gate state channels
+        (see location_roles_seed.sql). A rejoiner or re-onboarder must not
+        keep them, or they'd still see their old state's channels."""
+        stale = []
+        for other_state in config.STATES:
+            for name in (f"{other_state} Arrival", other_state):
+                if other_state == state and name == f"{state} Arrival":
+                    continue  # the new arrival role -- the flow depends on it
+                role = discord_utils.get_role(guild, name)
+                if role is not None:
+                    stale.append(role)
+        return stale
+
     async def _handle_arrival(self, member: discord.Member, state: str, state_cfg: dict):
-        # Already arrived somewhere? Don't process again (e.g. role was
-        # re-added by a moderator, or onboarding fired twice).
+        # First life: brand-new player, nothing to clean up. Second life
+        # (rejoin/re-onboard): the bot may have missed the leave event,
+        # leaving a stale 'named'/'immigrated' row and leftover state roles
+        # behind. That stale row is exactly why _handle_arrival used to
+        # skip the welcome -- reset it so the rejoiner walks the full
+        # arrival/!name/!immigrate path like a new player.
         existing = await database.get_player(member.id)
         if existing and existing["immigration_status"] != "unarrived":
-            return
+            old_nin_role_id = await database.reset_player_on_leave(member.id)
+            if old_nin_role_id:
+                nin_role = member.guild.get_role(old_nin_role_id)
+                if nin_role:
+                    try:
+                        await nin_role.delete(
+                            reason="Player re-arrived -- stale NIN role freed for reuse"
+                        )
+                    except discord.Forbidden:
+                        pass
+
+        # Strip any state roles still on the member before recording the
+        # fresh arrival, so channel access never carries over from a
+        # previous state (or a previous life in the same state).
+        stale_roles = [
+            role
+            for role in self._stale_state_roles(member.guild, state)
+            if role in member.roles
+        ]
+        if stale_roles:
+            try:
+                await member.remove_roles(
+                    *stale_roles, reason="Fresh arrival -- clearing stale state roles"
+                )
+            except discord.Forbidden:
+                # Without Manage Roles the bot can't strip them; the role
+                # gate stays stale, but the DB record below is still fixed.
+                pass
 
         await database.ensure_player_exists(member.id)
         await database.record_arrival(member.id, state)
@@ -84,9 +137,23 @@ class Onboarding(commands.Cog):
             member.guild, state, "BORDER & ENTRY", "arrival-terminal"
         )
         if terminal_channel:
-            await terminal_channel.send(
-                f"{member.mention} has arrived in {state}. Welcome to {state} State."
-            )
+            try:
+                await terminal_channel.send(
+                    f"{member.mention} has arrived in {state}. Welcome to {state} State."
+                )
+            except discord.Forbidden:
+                # 50013: the bot can't send in the Arrival Terminal (bot not
+                # a member / @everyone denied / role order above the bot's).
+                # The arrival itself is already recorded in the DB -- log
+                # the permission gap to Render's logs instead of crashing
+                # the whole on_member_update handler.
+                logger.warning(
+                    "onboarding: bot cannot send the welcome in the %s "
+                    "Arrival Terminal (id %s) -- check the bot's role "
+                    "there (Send Messages, not blocked by @everyone)",
+                    state,
+                    terminal_channel.id,
+                )
 
 
 async def setup(bot: commands.Bot):

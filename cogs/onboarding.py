@@ -44,6 +44,8 @@ class Onboarding(commands.Cog):
         The departure announcement is posted first, using the state on
         their record before it gets wiped -- a player who never picked a
         destination has no state to announce from, so they're skipped.
+        Their last current_location_id's write-access overwrite is cleared
+        next, for the same reason -- see _revoke_location_write_access.
         """
         player = await database.get_player(member.id)
         if player and player["current_state"]:
@@ -57,6 +59,9 @@ class Onboarding(commands.Cog):
                     f"Goodbye you will be missed."
                 )
 
+        if player and player["current_location_id"]:
+            await self._revoke_location_write_access(member, player["current_location_id"])
+
         old_role_id = await database.reset_player_on_leave(member.id)
         if old_role_id:
             role = member.guild.get_role(old_role_id)
@@ -65,6 +70,42 @@ class Onboarding(commands.Cog):
                     await role.delete(reason="Player left the server -- NIN freed for reuse")
                 except discord.Forbidden:
                     pass
+
+    async def _revoke_location_write_access(self, member: discord.Member, location_id: int) -> None:
+        """Discord does NOT drop a per-member channel permission overwrite
+        just because the member left the guild -- it's keyed by user ID on
+        the channel itself, so it silently re-applies if the same account
+        rejoins. reset_player_on_leave resets the DB row, but that's a
+        separate system from the Discord-side overwrite; this clears the
+        actual overwrite before the DB row underneath it is wiped.
+
+        Looks up the player's last current_location_id plus any direct
+        sublocation of it (e.g. refugee-camp under immigration-office),
+        since those share write access with their parent -- see
+        _grant_immigration_office_write_access above. Whatever channel it
+        was (immigration-office, refugee-camp, or anywhere they'd since
+        travelled to) gets its overwrite for this member cleared entirely."""
+        rows = await database.pool().fetch(
+            "SELECT state, category, channel_name FROM locations WHERE id = $1 OR parent_location_id = $1",
+            location_id,
+        )
+        for row in rows:
+            channel = discord_utils.get_channel(
+                member.guild, row["state"], row["category"], row["channel_name"]
+            )
+            if channel is None:
+                continue
+            try:
+                await channel.set_permissions(member, overwrite=None)
+            except discord.Forbidden:
+                logger.warning(
+                    "onboarding: bot lacks Manage Permissions in %s's %s (id %s) -- "
+                    "couldn't clear write access on leave; a rejoin with this "
+                    "account may keep typing rights there",
+                    row["state"],
+                    row["channel_name"],
+                    channel.id,
+                )
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):

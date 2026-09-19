@@ -28,6 +28,7 @@ INITIAL_COGS = [
     "cogs.cars",
     "cogs.petroleum",
     "cogs.phone",
+    "cogs.admin",
 ]
 
 

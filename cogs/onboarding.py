@@ -44,8 +44,11 @@ class Onboarding(commands.Cog):
         The departure announcement is posted first, using the state on
         their record before it gets wiped -- a player who never picked a
         destination has no state to announce from, so they're skipped.
-        Their last current_location_id's write-access overwrite is cleared
-        next, for the same reason -- see _revoke_location_write_access.
+        It's wrapped in try/except: an unhandled Forbidden here (bot
+        missing Send Messages in that channel) used to kill this whole
+        coroutine before the steps below ever ran. Their last
+        current_location_id's write-access overwrite is cleared next, for
+        the same reason -- see _revoke_location_write_access.
         """
         player = await database.get_player(member.id)
         if player and player["current_state"]:
@@ -54,10 +57,25 @@ class Onboarding(commands.Cog):
                 member.guild, state, "BORDER & ENTRY", "arrival-terminal"
             )
             if terminal_channel:
-                await terminal_channel.send(
-                    f"{member.mention} just left the Republic of Nigeria. "
-                    f"Goodbye you will be missed."
-                )
+                try:
+                    await terminal_channel.send(
+                        f"{member.mention} just left the Republic of Nigeria. "
+                        f"Goodbye you will be missed."
+                    )
+                except discord.Forbidden:
+                    # 50013, same root cause as the arrival-side warning in
+                    # _handle_arrival: bot lacks Send Messages there. This
+                    # used to be unguarded -- an unhandled Forbidden here
+                    # killed the whole coroutine before reaching the revoke
+                    # + DB reset + NIN role delete below, so a leaving
+                    # player never got cleaned up at all. Log and continue.
+                    logger.warning(
+                        "onboarding: bot cannot send the departure message in "
+                        "the %s Arrival Terminal (id %s) -- check the bot's "
+                        "role there (Send Messages, not blocked by @everyone)",
+                        state,
+                        terminal_channel.id,
+                    )
 
         if player and player["current_location_id"]:
             await self._revoke_location_write_access(member, player["current_location_id"])

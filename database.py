@@ -1,3 +1,4 @@
+import os
 import pathlib
 import asyncpg
 
@@ -8,46 +9,94 @@ _pool: asyncpg.Pool | None = None
 
 async def init_pool() -> None:
     """Create the connection pool and make sure the schema exists.
-    Call this once, in on_ready or before the bot logs in."""
-    global _pool
-    _pool = await asyncpg.create_pool(dsn=config.DATABASE_URL)
+    Call this once, in on_ready or before the bot logs in.
 
-    schema_path = pathlib.Path(__file__).parent / "schema.sql"
-    schema_sql = schema_path.read_text()
-    async with _pool.acquire() as conn:
-        await conn.execute(schema_sql)
+    Setting WIPEDB=1 in the service environment wipes the entire public
+    schema right before the schema+seeds below rebuild it -- a full reset
+    to a fresh database. Remove the env var afterwards, or the DB will be
+    wiped again on every restart."""
+    global _pool
+    if os.getenv("WIPEDB") == "1":
+        conn = await asyncpg.connect(dsn=config.DATABASE_URL)
+        await conn.execute("DROP SCHEMA public CASCADE")
+        await conn.execute("CREATE SCHEMA public")
+        print("WIPEDB=1: dropped and recreated schema public -- rebuilding from scratch")
+        await conn.close()
+
+    _pool = await asyncpg.create_pool(dsn=config.DATABASE_URL)
+    await _rebuild_schema_and_seeds(_pool)
+
+
+async def reset_database() -> None:
+    """Full factory reset behind !resetdatabase: drop the entire public
+    schema and rebuild it from schema.sql + seeds -- the same reset WIPEDB=1
+    performs at startup, but triggerable live from Discord. Every player row,
+    bank account, vehicle, card, trip, and pending request is gone; the world
+    (locations, roles, routes, state economy) comes back exactly as the seed
+    files define it, so the next player to arrive starts completely fresh."""
+    global _pool
+
+    conn = await asyncpg.connect(dsn=config.DATABASE_URL)
+    try:
+        await conn.execute("DROP SCHEMA public CASCADE")
+        await conn.execute("CREATE SCHEMA public")
+    finally:
+        await conn.close()
+
+    # Pool connections may hold cached statement plans against the pre-drop
+    # tables, so close the pool and build a fresh one rather than reusing a
+    # possibly-stale connection.
+    if _pool is not None:
+        await _pool.close()
+    _pool = await asyncpg.create_pool(dsn=config.DATABASE_URL)
+    await _rebuild_schema_and_seeds(_pool)
+
+
+def _sql_file(name: str) -> pathlib.Path:
+    return pathlib.Path(__file__).parent / name
+
+
+async def _rebuild_schema_and_seeds(p: asyncpg.Pool) -> None:
+    """Apply schema.sql, the numbered migrations, the subsystem schemas, and
+    the seed files in the exact order the bot has always used. Shared by
+    first-time startup (init_pool) and !resetdatabase (reset_database) so
+    the two paths can never drift apart."""
+    schema_path = _sql_file("schema.sql")
+    if schema_path.exists():
+        async with p.acquire() as conn:
+            await conn.execute(schema_path.read_text())
 
     # One-time (but safe-to-repeat) fixes for schema changes made after this
     # DB was first created -- see migration_001.sql's own header. Must run
     # right after schema.sql, before anything below that depends on the
     # fixed shape (location_roles_seed.sql needs location_roles' group_id
     # column to exist).
-    migration_path = pathlib.Path(__file__).parent / "migration_001.sql"
+    migration_path = _sql_file("migration_001.sql")
     if migration_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(migration_path.read_text())
 
-    migration_002_path = pathlib.Path(__file__).parent / "migration_002.sql"
+    migration_002_path = _sql_file("migration_002.sql")
     if migration_002_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(migration_002_path.read_text())
 
     # Location hierarchy (parent_location_id) + wiring refugee-camp under
     # immigration-office. See migration_003.sql's own header.
-    migration_003_path = pathlib.Path(__file__).parent / "migration_003.sql"
+    migration_003_path = _sql_file("migration_003.sql")
     if migration_003_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(migration_003_path.read_text())
 
-    transport_schema_path = pathlib.Path(__file__).parent / "schema_transportation.sql"
+    transport_schema_path = _sql_file("schema_transportation.sql")
     if transport_schema_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(transport_schema_path.read_text())
 
-    seed_path = pathlib.Path(__file__).parent / "locations_seed.sql"
+    seed_path = _sql_file("locations_seed.sql")
     if seed_path.exists():
         seed_sql = seed_path.read_text()
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(seed_sql)
 
     # roles_seed.sql / location_roles_seed.sql -- both auto-run now (used to
@@ -55,38 +104,38 @@ async def init_pool() -> None:
     # to forget after just editing the file and redeploying). Order matters:
     # both depend on locations_seed.sql above already having run, and
     # location_roles_seed.sql additionally depends on roles_seed.sql.
-    roles_seed_path = pathlib.Path(__file__).parent / "roles_seed.sql"
+    roles_seed_path = _sql_file("roles_seed.sql")
     if roles_seed_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(roles_seed_path.read_text())
 
-    location_roles_seed_path = pathlib.Path(__file__).parent / "location_roles_seed.sql"
+    location_roles_seed_path = _sql_file("location_roles_seed.sql")
     if location_roles_seed_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(location_roles_seed_path.read_text())
 
     # zones_routes_seed.sql depends on locations_seed.sql too (zone_categories
     # don't reference locations directly, but keeping the order consistent
     # avoids surprises), so it's loaded last, automatically.
-    zones_seed_path = pathlib.Path(__file__).parent / "zones_routes_seed.sql"
+    zones_seed_path = _sql_file("zones_routes_seed.sql")
     if zones_seed_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(zones_seed_path.read_text())
 
     # Banking backend (bank_accounts, players.cash) -- schema_transportation.sql's
     # state_accounts / credit_ministry_of_commerce() stand-in still handles the
     # *organization* side (treasury, Ministry of Commerce); this is the real
     # player-side account backend that banking.py already assumed existed.
-    banking_schema_path = pathlib.Path(__file__).parent / "schema_banking.sql"
+    banking_schema_path = _sql_file("schema_banking.sql")
     if banking_schema_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(banking_schema_path.read_text())
 
     # Private car system: tiers, dealership catalog, ownership, fuel,
     # distances, interstate routes, trips. See schema_vehicles.sql.
-    vehicles_schema_path = pathlib.Path(__file__).parent / "schema_vehicles.sql"
+    vehicles_schema_path = _sql_file("schema_vehicles.sql")
     if vehicles_schema_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(vehicles_schema_path.read_text())
 
     for seed_name in (
@@ -95,16 +144,16 @@ async def init_pool() -> None:
         "interstate_routes_seed.sql",
         "location_coordinates_seed.sql",
     ):
-        seed_file = pathlib.Path(__file__).parent / seed_name
+        seed_file = _sql_file(seed_name)
         if seed_file.exists():
-            async with _pool.acquire() as conn:
+            async with p.acquire() as conn:
                 await conn.execute(seed_file.read_text())
 
     # Oil/fuel economy: drilling, refining, the trailer/tanker fleet, and
     # the national treasury. See schema_petroleum.sql and cogs/petroleum.py.
-    petroleum_schema_path = pathlib.Path(__file__).parent / "schema_petroleum.sql"
+    petroleum_schema_path = _sql_file("schema_petroleum.sql")
     if petroleum_schema_path.exists():
-        async with _pool.acquire() as conn:
+        async with p.acquire() as conn:
             await conn.execute(petroleum_schema_path.read_text())
 
 
@@ -122,6 +171,10 @@ async def get_player(discord_id: int) -> asyncpg.Record | None:
     return await pool().fetchrow(
         "SELECT * FROM players WHERE discord_id = $1", discord_id
     )
+
+
+async def count_players() -> int:
+    return await pool().fetchval("SELECT COUNT(*) FROM players")
 
 
 async def ensure_player_exists(discord_id: int) -> None:

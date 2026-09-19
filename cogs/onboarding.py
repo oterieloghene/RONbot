@@ -17,8 +17,13 @@ class Onboarding(commands.Cog):
     three "{State} Arrival" roles directly.
 
     This cog just watches for that role showing up on a member and reacts:
-    records the arrival in the database and posts the welcome announcement
-    in that state's Arrival Terminal channel.
+    records the arrival in the database, posts the welcome announcement in
+    that state's Arrival Terminal channel, and grants write access to
+    immigration-office and its sublocation refugee-camp (current_location_id
+    is set to immigration-office by database.record_arrival -- see
+    _grant_immigration_office_write_access below for the Discord-side half
+    of that). arrival-terminal stays visible-only until the player travels
+    there for real.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -132,6 +137,7 @@ class Onboarding(commands.Cog):
 
         await database.ensure_player_exists(member.id)
         await database.record_arrival(member.id, state)
+        await self._grant_immigration_office_write_access(member, state)
 
         terminal_channel = discord_utils.get_channel(
             member.guild, state, "BORDER & ENTRY", "arrival-terminal"
@@ -153,6 +159,39 @@ class Onboarding(commands.Cog):
                     "there (Send Messages, not blocked by @everyone)",
                     state,
                     terminal_channel.id,
+                )
+
+    async def _grant_immigration_office_write_access(self, member: discord.Member, state: str) -> None:
+        """database.record_arrival already points current_location_id at
+        immigration-office -- this is the Discord-side half of that: the
+        actual send_messages overwrite. Both immigration-office and its
+        sublocation refugee-camp become writable together, since writability
+        flows downward to sublocations (see permissions.writable_location_ids).
+        arrival-terminal is left alone -- visible via the Arrival role, but
+        read-only until the player actually travels there.
+
+        Channel-not-found and Forbidden are both logged rather than raised --
+        a missing/misconfigured channel shouldn't crash on_member_update, and
+        the DB side (current_location_id) is already correct regardless."""
+        for channel_name in ("immigration-office", "refugee-camp"):
+            channel = discord_utils.get_channel(member.guild, state, "BORDER & ENTRY", channel_name)
+            if channel is None:
+                logger.warning(
+                    "onboarding: couldn't find %s's %s channel to grant write access -- "
+                    "check it exists under 'BORDER & ENTRY'",
+                    state,
+                    channel_name,
+                )
+                continue
+            try:
+                await channel.set_permissions(member, view_channel=True, send_messages=True)
+            except discord.Forbidden:
+                logger.warning(
+                    "onboarding: bot lacks Manage Permissions in %s's %s (id %s) -- "
+                    "couldn't grant write access on arrival",
+                    state,
+                    channel_name,
+                    channel.id,
                 )
 
 
